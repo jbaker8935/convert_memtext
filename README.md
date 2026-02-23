@@ -38,7 +38,7 @@ save filename.bin to the K2 in the same directory as anim_memtext.pgz and execut
 ```/- anim_memtext filename.bin```
 
 ## Frame rate
-The converter --frame-duration argument can be used to specify the number of 60Hz ticks between image frames.   The anim_memtext player *could* use that to determine the delay between frame renders.   As I write this, playback is hard-coded to 10fps, so consider it a future feature.  By default, convert_memtext will set the value to 6 ticks.
+The converter --frame-duration argument can be used to specify the number of 60Hz ticks between image frames.   The anim_memtext player currently ignores it, so consider it a future feature.  By default, convert_memtext will set the value to 6 ticks.
 
 ## Converter
 Images are converted to a 640x480 canvas which is divided into 80x60 cells, which will be reconstructed using memtext.   Since each reconstructed cell is a glyph and 2 colors, the trick is to find an optimal set of colors and limited glyph patterns that will give the best reconstruction with minimal perceptual error.  All cells throughout the entire animation are weighted to find the best 1024 representative glyphs and color sets.
