@@ -1,0 +1,50 @@
+# Wildbits K2 Memory Text based Animation Converter
+
+Simple python tools for converting an image sequence to a binary used by the anim_memtext program.
+
+## Installation
+
+Setup a python environment and load the dependencies
+
+```python -m pip install -r requirements.txt```
+
+For GPU acceleration of clustering you can install a rapids environment to get cuml.
+See install instructions at the [RAPIDS website](https://docs.rapids.ai/install/)
+
+## Creating an image sequence
+
+Images should be named with sequence numbers so conversion can do proper ordering.  The tool will consume all images in the directory provided as an argument.  So, one directory per video.
+
+Easiest way is to use ffmpeg:
+
+```ffmpeg -i videofile.mp4 -r 10 output_dir/output_%04d.png```
+
+This will convert 'videofile.mp4' to a series of numbered png files in the 'output_dir'.  Images will be output for 10 fps playback.
+
+## Converting
+
+```python convert_memtext.py --animation input_dir --output-bin filename.bin```
+
+If you want to see the reconstructed images on your host the render_memtext.py tool can take a bin file and show you what each frame will look like when output by the anim_memtext.pgz.
+
+```python render_memtext.py animation.bin  output_dir```
+
+animation.bin will be converted to a reconstructed png sequence in output_dir.
+
+## Playing the video
+
+save filename.bin to the K2 in the same directory as anim_memtext.pgz and execute.
+
+```/- anim_memtext filename.bin```
+
+## Frame rate
+The converter --frame-duration argument can be used to specify the number of 60Hz ticks between image frames.   The anim_memtext player *could* use that to determine the delay between frame renders.   As I write this, playback is hard-coded to 10fps, so consider it a future feature.  By default, convert_memtext will set the value to 6 ticks.
+
+## Converter
+Images are converted to a 640x480 canvas which is divided into 80x60 cells, which will be reconstructed using memtext.   Since each reconstructed cell is a glyph and 2 colors, the trick is to find an optimal set of colors and limited glyph patterns that will give the best reconstruction with minimal perceptual error.  All cells throughout the entire animation are weighted to find the best 1024 representative glyphs and color sets.
+Then each frame is reconstructed by finding the best glyph,color combination for each cell and writing the resulting font sets, color palettes and frame information to the binary file.
+
+I've done many experiments with palette and glyph selection so that conversion could be tailored for the image sequence source (e.g., color vs monochrome, fixed palette, strict edge detection, iterative refinement, different perceptual weighting).  Excessively complex to use, so this converter does none of that and it works fine.
+
+The file format allows for color palettes and fonts to be changed per frame.  That would allow for more accurate reconstruction but for streaming data efficiency this converter is using global palette and font sets for all frames.
+
