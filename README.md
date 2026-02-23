@@ -13,7 +13,7 @@ See install instructions at the [RAPIDS website](https://docs.rapids.ai/install/
 
 ## Creating an image sequence
 
-Images should be named with sequence numbers so conversion can do proper ordering.  The tool will consume all images in the directory provided as an argument.  So, one directory per video.
+Images should be named similarly with sequence numbers so conversion can do proper ordering.  The tool will consume all images in the directory provided as an argument and order them lexicographically.  So, one directory per video.
 
 Easiest way is to use ffmpeg:
 
