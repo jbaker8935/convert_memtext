@@ -186,21 +186,53 @@ def main():
     parser.add_argument('--output-bin', type=str, required=True, help='Output binary file (animation mode)')
     parser.add_argument('--frame-duration', type=int, default=6, help='Frame duration in 60Hz ticks')
     parser.add_argument('--rle', action='store_true', help='Enable RLE encoding for binary output (where supported)')
+    parser.add_argument(
+        '--encoding-mode',
+        choices=['global', 'frame', 'hybrid'],
+        default='global',
+        help='Encoding mode: global uses one palette/font set for all frames, frame derives palette/fonts per frame, hybrid uses global palette with per-frame fonts. Modes frame/hybrid are experimental.'
+    )
+    parser.add_argument(
+        '--coherence-medoids',
+        type=int,
+        default=0,
+        help='Number of globally-stable coherence medoids to reserve for frame stability (0=disabled, e.g. 32, 64, 128). Only used with frame/hybrid modes.'
+    )
     args = parser.parse_args()
 
     print("K2 Memtext Image Converter")
     print("============================")
     print("Animation mode")
     print(f"Processing directory: {args.animation}")
-    print("MEMTEXT mode enabled: 256-color palettes, 1024 medoids in 4 font sets, pattern inversion")
+    n_coherence = args.coherence_medoids
+    if args.encoding_mode == 'global':
+        if n_coherence > 0:
+            print("Note: --coherence-medoids is ignored in global mode (all medoids are already global)")
+        print("MEMTEXT global mode: 256-color palette, 1024 medoids in 4 font sets, shared across all frames")
+        frames_data = process_animation_frames_memtext_global(args.animation)
+    elif args.encoding_mode == 'hybrid':
+        print("MEMTEXT hybrid mode: global 256-color palette, per-frame 512 medoids in 2 font sets")
+        if n_coherence > 0:
+            print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
+        frames_data = process_animation_frames_memtext_hybrid(args.animation, n_coherence=n_coherence)
+    else:
+        print("MEMTEXT frame mode: per-frame 256-color palette, 512 medoids in 2 font sets, double-buffered LUT/font IDs")
+        if n_coherence > 0:
+            print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
+        frames_data = process_animation_frames_memtext_frame(args.animation, n_coherence=n_coherence)
 
-    frames_data = process_animation_frames_memtext(args.animation)
     if not frames_data:
         print("Error: No frames processed successfully")
         sys.exit(1)
 
     print("Saving memtext animation output...")
-    save_output_bin_memtext(frames_data, args.output_bin, frame_duration=args.frame_duration, use_rle=args.rle)
+    save_output_bin_memtext(
+        frames_data,
+        args.output_bin,
+        frame_duration=args.frame_duration,
+        use_rle=args.rle,
+        encoding_mode=args.encoding_mode,
+    )
     print("MEMTEXT animation conversion completed successfully!")
 
 
@@ -332,7 +364,444 @@ def create_memtext_256_color_palette(image_files):
     return palette
 
 
-def process_animation_frames_memtext(input_dir):
+def create_memtext_256_color_palette_from_image(image):
+    """Create a 256-color palette from one scaled frame image."""
+    img_np = np.array(image, dtype=np.uint8)
+    pixels = img_np.reshape(-1, 3)
+    unique_pixels = np.unique(pixels.astype(np.float32), axis=0)
+
+    n_clusters = min(255, len(unique_pixels))
+    palette = np.zeros((256, 3), dtype=np.uint8)
+
+    if n_clusters < 255:
+        palette[1:n_clusters + 1] = unique_pixels[:n_clusters].astype(np.uint8)
+        for i in range(n_clusters + 1, 256):
+            palette[i] = [128, 128, 128]
+    else:
+        kmeans = make_kmeans(n_clusters=255, random_state=42, n_init=10)
+        kmeans.fit(unique_pixels)
+        centers = kmeans.cluster_centers_.astype(np.uint8)
+        palette[1:256] = centers
+
+    return palette
+
+
+def extract_frame_tiles(image):
+    """Extract 8x8 MEMTEXT tiles and source pixels from a scaled frame image."""
+    img_np = np.array(image)
+    block_height = 24
+    num_blocks = 20
+    chars_per_block_row = 3
+    chars_per_block = chars_per_block_row * 80
+    total_chars = num_blocks * chars_per_block
+
+    frame_tiles = []
+    for i in range(total_chars):
+        block_idx = i // chars_per_block
+        char_in_block = i % chars_per_block
+        char_row = char_in_block // 80
+        char_col = char_in_block % 80
+        y_start = block_idx * block_height
+        y0 = y_start + char_row * 8
+        x0 = char_col * 8
+        char_img = img_np[y0:y0 + 8, x0:x0 + 8, :]
+
+        frame_tiles.append({
+            'pixels': np.ascontiguousarray(char_img.astype(np.uint8))
+        })
+
+    return frame_tiles
+
+
+def derive_medoids_from_tiles(frame_tiles, n_medoids, palette):
+    """Derive medoid patterns from frame tiles using canonicalized inversion-aware patterns."""
+    unique_canonical = {}
+    for tile in frame_tiles:
+        font_def, _, _ = optimize_character_memtext(tile['pixels'], palette)
+        canonical, _ = get_canonical_pattern(font_def)
+        key = pattern_key(canonical)
+        if key not in unique_canonical:
+            unique_canonical[key] = canonical
+
+    patterns_list = list(unique_canonical.values())
+    zero_tile = np.zeros(8, dtype=np.uint8)
+    zero_key = pattern_key(zero_tile)
+    if zero_key not in unique_canonical:
+        patterns_list.insert(0, zero_tile)
+
+    patterns_arr = np.array(patterns_list, dtype=np.uint8)
+    cluster_target = min(len(patterns_arr), n_medoids)
+
+    if cluster_target < n_medoids:
+        clustered_medoids = patterns_arr.copy()
+        if len(clustered_medoids) < n_medoids:
+            pad_count = n_medoids - len(clustered_medoids)
+            pad = np.zeros((pad_count, 8), dtype=np.uint8)
+            clustered_medoids = np.vstack([clustered_medoids, pad])
+    else:
+        n_unique = patterns_arr.shape[0]
+        edge_feats = np.zeros((n_unique, 64), dtype=np.float32)
+        density_feats = np.zeros((n_unique, 17), dtype=np.float32)
+        raw_bytes = np.zeros((n_unique, 8), dtype=np.float32)
+
+        for i in range(n_unique):
+            edge_feats[i] = font_to_edge_descriptor(patterns_arr[i])
+            density_feats[i] = font_density_features(patterns_arr[i])
+            raw_bytes[i] = patterns_arr[i].astype(np.float32)
+
+        def norm_feats(feats):
+            mean = feats.mean(axis=0)
+            std = feats.std(axis=0) + 1e-6
+            return (feats - mean) / std
+
+        edge_feats_n = norm_feats(edge_feats) * 0.1
+        density_feats_n = norm_feats(density_feats) * 0.1
+        raw_bytes_n = norm_feats(raw_bytes) * 10.0
+
+        perceptual_descriptors = np.concatenate([edge_feats_n, density_feats_n, raw_bytes_n], axis=1)
+
+        try:
+            pca = PCA(n_components=min(perceptual_descriptors.shape))
+            pca.fit(perceptual_descriptors)
+            font_features = pca.transform(perceptual_descriptors)
+        except Exception:
+            font_features = perceptual_descriptors
+
+        kmeans = make_kmeans(n_clusters=cluster_target, random_state=42, n_init=10)
+        kmeans.fit(font_features)
+        cluster_labels = kmeans.labels_
+        clustered_medoids = compute_medoids(patterns_arr, cluster_labels, cluster_target)
+
+    if len(clustered_medoids) < n_medoids:
+        pad_count = n_medoids - len(clustered_medoids)
+        pad = np.zeros((pad_count, 8), dtype=np.uint8)
+        clustered_medoids = np.vstack([clustered_medoids, pad])
+    elif len(clustered_medoids) > n_medoids:
+        clustered_medoids = clustered_medoids[:n_medoids]
+
+    return clustered_medoids
+
+
+def extract_canonical_patterns(frame_tiles, palette):
+    """Extract unique canonical patterns from frame tiles.
+
+    Returns:
+        dict mapping pattern_key -> canonical np.array pattern
+    """
+    unique_canonical = {}
+    for tile in frame_tiles:
+        font_def, _, _ = optimize_character_memtext(tile['pixels'], palette)
+        canonical, _ = get_canonical_pattern(font_def)
+        key = pattern_key(canonical)
+        if key not in unique_canonical:
+            unique_canonical[key] = canonical
+    return unique_canonical
+
+
+def cluster_patterns_to_medoids(patterns_arr, n_target):
+    """Cluster an array of canonical patterns to n_target medoids.
+
+    Uses the same PCA + KMeans + Hamming-distance medoid refinement pipeline
+    as derive_medoids_from_tiles.
+
+    Args:
+        patterns_arr: np.array of shape (n_patterns, 8), dtype=uint8
+        n_target: desired number of medoids
+
+    Returns:
+        np.array of shape (n_target, 8)
+    """
+    n_unique = patterns_arr.shape[0]
+
+    if n_unique <= n_target:
+        result = patterns_arr.copy()
+        if len(result) < n_target:
+            pad = np.zeros((n_target - len(result), 8), dtype=np.uint8)
+            result = np.vstack([result, pad])
+        return result
+
+    edge_feats = np.zeros((n_unique, 64), dtype=np.float32)
+    density_feats = np.zeros((n_unique, 17), dtype=np.float32)
+    raw_bytes = np.zeros((n_unique, 8), dtype=np.float32)
+
+    for i in range(n_unique):
+        edge_feats[i] = font_to_edge_descriptor(patterns_arr[i])
+        density_feats[i] = font_density_features(patterns_arr[i])
+        raw_bytes[i] = patterns_arr[i].astype(np.float32)
+
+    def norm_feats(feats):
+        mean = feats.mean(axis=0)
+        std = feats.std(axis=0) + 1e-6
+        return (feats - mean) / std
+
+    edge_feats_n = norm_feats(edge_feats) * 0.1
+    density_feats_n = norm_feats(density_feats) * 0.1
+    raw_bytes_n = norm_feats(raw_bytes) * 10.0
+
+    perceptual_descriptors = np.concatenate([edge_feats_n, density_feats_n, raw_bytes_n], axis=1)
+
+    try:
+        pca = PCA(n_components=min(perceptual_descriptors.shape))
+        pca.fit(perceptual_descriptors)
+        font_features = pca.transform(perceptual_descriptors)
+    except Exception:
+        font_features = perceptual_descriptors
+
+    kmeans = make_kmeans(n_clusters=n_target, random_state=42, n_init=10)
+    kmeans.fit(font_features)
+    cluster_labels = kmeans.labels_
+    return compute_medoids(patterns_arr, cluster_labels, n_target)
+
+
+def compute_coherence_medoids(all_frame_canonical_sets, n_coherence):
+    """Compute globally-stable coherence medoids from cross-frame pattern frequency.
+
+    Identifies canonical patterns appearing in multiple frames and clusters them
+    (weighted by frame frequency) to produce n_coherence medoids that best
+    represent temporally stable patterns across the animation.
+
+    Args:
+        all_frame_canonical_sets: list of dicts, each {pattern_key: np.array} per frame
+        n_coherence: number of coherence medoids to produce
+
+    Returns:
+        np.array of shape (n_coherence, 8), dtype=uint8
+    """
+    # Count in how many frames each pattern appears
+    pattern_frame_count = {}
+    pattern_data = {}
+    for frame_set in all_frame_canonical_sets:
+        for key, pat in frame_set.items():
+            if key not in pattern_frame_count:
+                pattern_frame_count[key] = 0
+                pattern_data[key] = pat
+            pattern_frame_count[key] += 1
+
+    n_frames = len(all_frame_canonical_sets)
+    print(f"  Coherence: {len(pattern_frame_count)} unique canonical patterns across {n_frames} frames")
+
+    # Select patterns appearing in >= 2 frames, sorted by frequency
+    multi_frame = [(key, count) for key, count in pattern_frame_count.items() if count >= 2]
+    multi_frame.sort(key=lambda x: -x[1])
+
+    print(f"  Coherence: {len(multi_frame)} patterns appear in 2+ frames")
+
+    if not multi_frame:
+        print("  Coherence: no cross-frame patterns found; returning empty set")
+        return np.zeros((n_coherence, 8), dtype=np.uint8)
+
+    patterns_list = [pattern_data[key] for key, _ in multi_frame]
+    weights = np.array([count for _, count in multi_frame], dtype=np.float32)
+    patterns_arr = np.array(patterns_list, dtype=np.uint8)
+
+    if len(patterns_arr) <= n_coherence:
+        result = patterns_arr.copy()
+        if len(result) < n_coherence:
+            pad = np.zeros((n_coherence - len(result), 8), dtype=np.uint8)
+            result = np.vstack([result, pad])
+        print(f"  Coherence: only {len(patterns_arr)} candidates; using all (padded to {n_coherence})")
+        return result
+
+    print(f"  Coherence: clustering {len(patterns_arr)} cross-frame patterns to {n_coherence} medoids (weighted by frame frequency)...")
+
+    # Build feature descriptors (same pipeline as derive_medoids_from_tiles)
+    n_unique = len(patterns_arr)
+    edge_feats = np.zeros((n_unique, 64), dtype=np.float32)
+    density_feats = np.zeros((n_unique, 17), dtype=np.float32)
+    raw_bytes = np.zeros((n_unique, 8), dtype=np.float32)
+
+    for i in range(n_unique):
+        edge_feats[i] = font_to_edge_descriptor(patterns_arr[i])
+        density_feats[i] = font_density_features(patterns_arr[i])
+        raw_bytes[i] = patterns_arr[i].astype(np.float32)
+
+    def norm_feats(feats):
+        mean = feats.mean(axis=0)
+        std = feats.std(axis=0) + 1e-6
+        return (feats - mean) / std
+
+    edge_feats_n = norm_feats(edge_feats) * 0.1
+    density_feats_n = norm_feats(density_feats) * 0.1
+    raw_bytes_n = norm_feats(raw_bytes) * 10.0
+
+    perceptual_descriptors = np.concatenate([edge_feats_n, density_feats_n, raw_bytes_n], axis=1)
+
+    try:
+        pca = PCA(n_components=min(perceptual_descriptors.shape))
+        pca.fit(perceptual_descriptors)
+        font_features = pca.transform(perceptual_descriptors)
+    except Exception:
+        font_features = perceptual_descriptors
+
+    kmeans = make_kmeans(n_clusters=n_coherence, random_state=42, n_init=10)
+    try:
+        kmeans.fit(font_features, sample_weight=weights)
+    except TypeError:
+        # Fallback if KMeans implementation doesn't support sample_weight
+        kmeans.fit(font_features)
+    cluster_labels = kmeans.labels_
+
+    coherence_medoids = compute_medoids(patterns_arr, cluster_labels, n_coherence)
+    print(f"  Coherence: produced {len(coherence_medoids)} stable medoids")
+    return coherence_medoids
+
+
+def derive_medoids_with_coherence(frame_canonical_dict, n_medoids, coherence_medoids):
+    """Derive per-frame medoids with coherence medoids reserved in the first slots.
+
+    Coherence medoids occupy positions [0, n_coherence). Remaining slots are
+    filled with frame-specific medoids from patterns not already covered by
+    the coherence set.
+
+    Args:
+        frame_canonical_dict: dict {pattern_key: np.array} of frame patterns
+        n_medoids: total number of medoids for this frame
+        coherence_medoids: np.array (n_coherence, 8) of reserved medoids
+
+    Returns:
+        np.array of shape (n_medoids, 8)
+    """
+    n_coherence = len(coherence_medoids)
+    n_frame_specific = n_medoids - n_coherence
+
+    if n_frame_specific <= 0:
+        return coherence_medoids[:n_medoids].copy()
+
+    # Build set of coherence medoid keys for fast exclusion
+    coherence_keys = set()
+    for i in range(n_coherence):
+        coherence_keys.add(pattern_key(coherence_medoids[i]))
+
+    # Collect frame patterns not already in the coherence set
+    frame_only = []
+    for key, pattern in frame_canonical_dict.items():
+        if key not in coherence_keys:
+            frame_only.append(pattern)
+
+    # Ensure zero tile exists somewhere
+    zero_tile = np.zeros(8, dtype=np.uint8)
+    zero_key = pattern_key(zero_tile)
+    if zero_key not in coherence_keys and zero_key not in {pattern_key(p) for p in frame_only}:
+        frame_only.insert(0, zero_tile)
+
+    if not frame_only:
+        # All frame patterns are covered by coherence set
+        pad = np.zeros((n_frame_specific, 8), dtype=np.uint8)
+        return np.vstack([coherence_medoids, pad])[:n_medoids]
+
+    frame_patterns_arr = np.array(frame_only, dtype=np.uint8)
+    frame_medoids = cluster_patterns_to_medoids(frame_patterns_arr, n_frame_specific)
+
+    combined = np.vstack([coherence_medoids, frame_medoids])
+    if len(combined) > n_medoids:
+        combined = combined[:n_medoids]
+    elif len(combined) < n_medoids:
+        pad = np.zeros((n_medoids - len(combined), 8), dtype=np.uint8)
+        combined = np.vstack([combined, pad])
+
+    return combined
+
+
+def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids):
+    """Assign each tile to best medoid/font-set and FG/BG indices."""
+    n_medoids = clustered_medoids.shape[0]
+    n_tiles = len(frame_tiles)
+    n_font_sets = max(1, n_medoids // 256)
+
+    tile_assignments = np.zeros((n_tiles, 5), dtype=np.uint16)
+
+    medoid_bits = np.zeros((n_medoids, 64), dtype=np.uint8)
+    for m_idx in range(n_medoids):
+        pattern = clustered_medoids[m_idx]
+        for r in range(8):
+            byte = int(pattern[r])
+            for c in range(8):
+                medoid_bits[m_idx, r * 8 + c] = (byte >> (7 - c)) & 1
+
+    edge_pixel_weights = np.ones(64, dtype=np.float32)
+    palette_f = palette.astype(np.float32)
+
+    for i, tile in enumerate(frame_tiles):
+        orig_rgb = tile['pixels'].reshape(-1, 3).astype(np.float32)
+
+        unique_colors = np.unique(orig_rgb, axis=0)
+        if len(unique_colors) < 2:
+            avg = orig_rgb.mean(axis=0)
+            dists = np.linalg.norm(palette_f - avg, axis=1)
+            dists[0] = float('inf')
+            best_color = int(np.argmin(dists))
+            tile_assignments[i] = [0, 0, best_color, best_color, 0]
+            continue
+
+        luminance = 0.299 * orig_rgb[:, 0] + 0.587 * orig_rgb[:, 1] + 0.114 * orig_rgb[:, 2]
+        threshold = np.median(luminance)
+
+        fg_mask = luminance >= threshold
+        bg_mask = ~fg_mask
+
+        if np.any(fg_mask):
+            fg_center = orig_rgb[fg_mask].mean(axis=0)
+        else:
+            fg_center = orig_rgb.mean(axis=0)
+        if np.any(bg_mask):
+            bg_center = orig_rgb[bg_mask].mean(axis=0)
+        else:
+            bg_center = orig_rgb.mean(axis=0)
+
+        fg_dists = np.linalg.norm(palette_f - fg_center, axis=1)
+        fg_dists[0] = float('inf')
+        fg_idx = int(np.argmin(fg_dists))
+
+        bg_dists = np.linalg.norm(palette_f - bg_center, axis=1)
+        bg_idx = int(np.argmin(bg_dists))
+
+        if fg_idx == bg_idx:
+            bg_dists[bg_idx] = float('inf')
+            bg_idx = int(np.argmin(bg_dists))
+
+        ideal_pattern = np.zeros(8, dtype=np.uint8)
+        for row in range(8):
+            byte = 0
+            for col in range(8):
+                pixel_idx = row * 8 + col
+                if fg_mask[pixel_idx]:
+                    byte |= (1 << (7 - col))
+            ideal_pattern[row] = byte
+
+        ideal_bits = np.zeros(64, dtype=np.uint8)
+        for r in range(8):
+            byte = ideal_pattern[r]
+            for c in range(8):
+                ideal_bits[r * 8 + c] = (byte >> (7 - c)) & 1
+
+        xor_normal = np.bitwise_xor(medoid_bits, ideal_bits)
+        hamming_normal = np.sum(xor_normal * edge_pixel_weights, axis=1)
+
+        ideal_bits_inv = 1 - ideal_bits
+        xor_inv = np.bitwise_xor(medoid_bits, ideal_bits_inv)
+        hamming_inv = np.sum(xor_inv * edge_pixel_weights, axis=1)
+
+        best_normal_idx = int(np.argmin(hamming_normal))
+        best_inv_idx = int(np.argmin(hamming_inv))
+
+        if hamming_normal[best_normal_idx] <= hamming_inv[best_inv_idx]:
+            best_medoid_idx = best_normal_idx
+            best_invert = 0
+        else:
+            best_medoid_idx = best_inv_idx
+            best_invert = 1
+
+        fs = best_medoid_idx // 256
+        if fs >= n_font_sets:
+            fs = n_font_sets - 1
+        char_idx = best_medoid_idx % 256
+
+        tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert]
+
+    return tile_assignments
+
+
+def process_animation_frames_memtext_global(input_dir):
     """Process animation frames in MEMTEXT mode.
     
     Key differences from regular animation mode:
@@ -361,43 +830,15 @@ def process_animation_frames_memtext(input_dir):
     # Step 1: Create 256-color global palette
     palette = create_memtext_256_color_palette(image_files)
     
-    # Step 2: Load all frames and extract unique 8x8 patterns
+    # Step 2: Load all frames and extract tiles
     print("Extracting 8x8 patterns from all frames...")
     all_tiles = []
-    frame_tile_indices = []  # (start, end) for each frame
-    
-    
+    frame_tile_indices = []
+
     for idx, image_file in enumerate(image_files):
         print(f"Loading frame {idx+1}/{len(image_files)}: {os.path.basename(image_file)}")
         image = load_and_scale_image(image_file)
-        
-        img_np = np.array(image)
-        block_height = 24
-        num_blocks = 20
-        chars_per_block_row = 3
-        chars_per_block = chars_per_block_row * 80
-        total_chars = num_blocks * chars_per_block
-        
-        frame_tiles = []
-        for i in range(total_chars):
-            block_idx = i // chars_per_block
-            char_in_block = i % chars_per_block
-            char_row = char_in_block // 80
-            char_col = char_in_block % 80
-            y_start = block_idx * block_height
-            y0 = y_start + char_row * 8
-            x0 = char_col * 8
-            char_img = img_np[y0:y0+8, x0:x0+8, :]
-            
-            # Generate initial font pattern using local optimization
-            # We use the 256-color palette
-            font_def, _, _ = optimize_character_memtext(char_img, palette)
-            
-            frame_tiles.append({
-                'font': np.array(font_def, dtype=np.uint8),
-                'pixels': np.ascontiguousarray(char_img.astype(np.uint8))
-            })
-        
+        frame_tiles = extract_frame_tiles(image)
         start_idx = len(all_tiles)
         all_tiles.extend(frame_tiles)
         end_idx = len(all_tiles)
@@ -405,228 +846,24 @@ def process_animation_frames_memtext(input_dir):
     
     print(f"Extracted {len(all_tiles)} total tiles")
     
-    # Step 3: Extract unique patterns considering inversion
-    print("Finding unique patterns (considering inversions)...")
-    unique_canonical = {}  # canonical_key -> (canonical_pattern, original_was_inverted)
-    
-    for tile in all_tiles:
-        pattern = tile['font']
-        canonical, was_inverted = get_canonical_pattern(pattern)
-        key = pattern_key(canonical)
-        if key not in unique_canonical:
-            unique_canonical[key] = canonical
-    
-    print(f"Found {len(unique_canonical)} unique canonical patterns (after inversion reduction)")
-    
-    # Step 4: Cluster to 1024 medoids
+    # Step 3: Cluster to 1024 medoids
     print("Clustering to 1024 medoids...")
-    patterns_list = list(unique_canonical.values())
-    
-    # Always include all-zeros pattern
-    zero_tile = np.zeros(8, dtype=np.uint8)
-    zero_key = pattern_key(zero_tile)
-    if zero_key not in unique_canonical:
-        patterns_list.insert(0, zero_tile)
-    
-    patterns_arr = np.array(patterns_list, dtype=np.uint8)
-    
-    # Target 1024 medoids
-    n_medoids = 1024
-    cluster_target = min(len(patterns_arr), n_medoids)
-    
-    if cluster_target < n_medoids:
-        # If fewer patterns than 1024, use them all and pad
-        clustered_medoids = patterns_arr.copy()
-        if len(clustered_medoids) < n_medoids:
-            # Pad with zeros
-            pad_count = n_medoids - len(clustered_medoids)
-            pad = np.zeros((pad_count, 8), dtype=np.uint8)
-            clustered_medoids = np.vstack([clustered_medoids, pad])
-    else:
-        # Cluster using features
-        n_unique = patterns_arr.shape[0]
-        edge_feats = np.zeros((n_unique, 64), dtype=np.float32)
-        density_feats = np.zeros((n_unique, 17), dtype=np.float32)
-        raw_bytes = np.zeros((n_unique, 8), dtype=np.float32)
-        
-        for i in range(n_unique):
-            edge_feats[i] = font_to_edge_descriptor(patterns_arr[i])
-            density_feats[i] = font_density_features(patterns_arr[i])
-            raw_bytes[i] = patterns_arr[i].astype(np.float32)
-        
-        def norm_feats(feats):
-            mean = feats.mean(axis=0)
-            std = feats.std(axis=0) + 1e-6
-            return (feats - mean) / std
-        
-        edge_feats_n = norm_feats(edge_feats) * 0.1
-        density_feats_n = norm_feats(density_feats) * 0.1
-        raw_bytes_n = norm_feats(raw_bytes) * 10.0
-        
-        perceptual_descriptors = np.concatenate([edge_feats_n, density_feats_n, raw_bytes_n], axis=1)
-        
-        # PCA for dimensionality reduction
-        try:
-            pca = PCA(n_components=min(perceptual_descriptors.shape))
-            pca.fit(perceptual_descriptors)
-            font_features = pca.transform(perceptual_descriptors)
-        except Exception:
-            font_features = perceptual_descriptors
-        
-        # Cluster
-        kmeans = make_kmeans(n_clusters=cluster_target, random_state=42, n_init=10)
-        kmeans.fit(font_features)
-        cluster_labels = kmeans.labels_
-        
-        # Compute medoids
-        clustered_medoids = compute_medoids(patterns_arr, cluster_labels, cluster_target)
-    
+    clustered_medoids = derive_medoids_from_tiles(all_tiles, 1024, palette)
     print(f"Created {len(clustered_medoids)} medoids")
-    
-    # Ensure we have exactly 1024 medoids
-    if len(clustered_medoids) < 1024:
-        pad_count = 1024 - len(clustered_medoids)
-        pad = np.zeros((pad_count, 8), dtype=np.uint8)
-        clustered_medoids = np.vstack([clustered_medoids, pad])
-    elif len(clustered_medoids) > 1024:
-        clustered_medoids = clustered_medoids[:1024]
     
     # Split into 4 font sets of 256 each
     font_sets = [clustered_medoids[i*256:(i+1)*256] for i in range(4)]
     
     print(f"Split medoids into 4 font sets of 256 patterns each")
     
-    # Precompute medoid masks for error-based matching
-    all_medoid_masks = np.zeros((1024, 64), dtype=bool)
-    for m_idx in range(1024):
-        pattern = clustered_medoids[m_idx]
-        bits = []
-        for r in range(8):
-            byte = int(pattern[r])
-            for c in range(8):
-                bits.append((byte >> (7 - c)) & 1)
-        all_medoid_masks[m_idx] = np.array(bits, dtype=bool)
-    
-    edge_pixel_weights = np.ones(64, dtype=np.float32)
-    
-    # Step 6: Process each frame - assign tiles to medoids + colors
+    # Step 4: Process each frame - assign tiles to medoids + colors
     print("Assigning tiles to medoids for each frame...")
     frames_data = []
-    
-    # Precompute medoid bit patterns for fast Hamming distance
-    medoid_bits = np.zeros((1024, 64), dtype=np.uint8)
-    for m_idx in range(1024):
-        pattern = clustered_medoids[m_idx]
-        for r in range(8):
-            byte = int(pattern[r])
-            for c in range(8):
-                medoid_bits[m_idx, r * 8 + c] = (byte >> (7 - c)) & 1
-    
-    # Precompute palette as float for fast matching
-    palette_f = palette.astype(np.float32)
-    
+
     for frame_idx, (start, end) in enumerate(frame_tile_indices):
         print(f"Processing frame {frame_idx+1}/{len(frame_tile_indices)}...")
         frame_tiles = all_tiles[start:end]
-        n_tiles = len(frame_tiles)
-        
-        # For MEMTEXT, we need to output:
-        # - tile_data: array of 16-bit values encoding (font_set:2, char_index:8, fg:8, bg:8, invert:1) 
-        # Store (font_set, char_index, fg_idx, bg_idx, invert_bit) per tile
-        
-        tile_assignments = np.zeros((n_tiles, 5), dtype=np.uint16)
-        
-        # For each tile, find best medoid (considering inversion) and best FG/BG
-        for i, tile in enumerate(frame_tiles):
-            orig_rgb = tile['pixels'].reshape(-1, 3).astype(np.float32)
-            
-            # First, determine FG and BG colors from the tile pixels using simpler clustering
-            unique_colors = np.unique(orig_rgb, axis=0)
-            if len(unique_colors) < 2:
-                # Uniform tile - find closest palette color
-                avg = orig_rgb.mean(axis=0)
-                dists = np.linalg.norm(palette_f - avg, axis=1)
-                dists[0] = float('inf')  # Skip transparent
-                best_color = int(np.argmin(dists))
-                # Use all-zeros medoid with this color as both fg and bg
-                tile_assignments[i] = [0, 0, best_color, best_color, 0]
-                continue
-            
-            # Use simple threshold-based segmentation (faster than k-means)
-            luminance = 0.299 * orig_rgb[:, 0] + 0.587 * orig_rgb[:, 1] + 0.114 * orig_rgb[:, 2]
-            threshold = np.median(luminance)
-            
-            fg_mask = luminance >= threshold
-            bg_mask = ~fg_mask
-            
-            # Compute average colors for each region
-            if np.any(fg_mask):
-                fg_center = orig_rgb[fg_mask].mean(axis=0)
-            else:
-                fg_center = orig_rgb.mean(axis=0)
-            if np.any(bg_mask):
-                bg_center = orig_rgb[bg_mask].mean(axis=0)
-            else:
-                bg_center = orig_rgb.mean(axis=0)
-            
-            # Map centers to palette
-            fg_dists = np.linalg.norm(palette_f - fg_center, axis=1)
-            fg_dists[0] = float('inf')
-            fg_idx = int(np.argmin(fg_dists))
-            
-            bg_dists = np.linalg.norm(palette_f - bg_center, axis=1)
-            bg_idx = int(np.argmin(bg_dists))
-            
-            if fg_idx == bg_idx:
-                bg_dists[bg_idx] = float('inf')
-                bg_idx = int(np.argmin(bg_dists))
-            
-            # Build ideal font pattern from mask
-            ideal_pattern = np.zeros(8, dtype=np.uint8)
-            for row in range(8):
-                byte = 0
-                for col in range(8):
-                    pixel_idx = row * 8 + col
-                    if fg_mask[pixel_idx]:
-                        byte |= (1 << (7 - col))
-                ideal_pattern[row] = byte
-            
-            # Convert ideal pattern to bits
-            ideal_bits = np.zeros(64, dtype=np.uint8)
-            for r in range(8):
-                byte = ideal_pattern[r]
-                for c in range(8):
-                    ideal_bits[r * 8 + c] = (byte >> (7 - c)) & 1
-
-            # Find closest medoid using weighted Hamming distance
-            # XOR gives 1 where bits differ
-            xor_normal = np.bitwise_xor(medoid_bits, ideal_bits)
-            # Weighted Hamming: multiply by edge weights before summing
-            hamming_normal = np.sum(xor_normal * edge_pixel_weights, axis=1)
-            
-            # Also check inverted
-            ideal_bits_inv = 1 - ideal_bits
-            xor_inv = np.bitwise_xor(medoid_bits, ideal_bits_inv)
-            hamming_inv = np.sum(xor_inv * edge_pixel_weights, axis=1)
-            
-            # Find best
-            best_normal_idx = int(np.argmin(hamming_normal))
-            best_inv_idx = int(np.argmin(hamming_inv))
-            
-            if hamming_normal[best_normal_idx] <= hamming_inv[best_inv_idx]:
-                best_medoid_idx = best_normal_idx
-                best_invert = 0
-            else:
-                best_medoid_idx = best_inv_idx
-                best_invert = 1
-            
-            fs = best_medoid_idx // 256
-            char_idx = best_medoid_idx % 256
-            
-            # Store assignment - fg/bg stay the same regardless of inversion
-            # The invert bit tells the renderer to flip pattern bits, which
-            # effectively swaps which pixels get fg vs bg colors
-            tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert]
+        tile_assignments = assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids)
         
         frames_data.append({
             'width': 640,
@@ -642,6 +879,203 @@ def process_animation_frames_memtext(input_dir):
     frames_data[0]['global_palette'] = palette
     frames_data[0]['global_font_sets'] = font_sets
     
+    return frames_data
+
+
+def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0):
+    """Process animation frames in MEMTEXT hybrid mode.
+
+    Hybrid mode characteristics (workaround for FPGA LUT 1 bug):
+    - Global 256-color palette derived from all frames (output once, chunk_id=0)
+    - Per-frame 512 medoids split into 2 font sets of 256 (output per frame)
+    - Font set IDs alternate between pairs (0,1) and (2,3) for double buffering
+    - No per-frame color palette output
+    - Optional coherence medoids for cross-frame temporal stability
+    """
+    image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp', '*.tiff']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(input_dir, ext)))
+        image_files.extend(glob.glob(os.path.join(input_dir, ext.upper())))
+    image_files = sorted(image_files)
+
+    if not image_files:
+        print(f"Error: No image files found in directory {input_dir}")
+        return []
+
+    print(f"Found {len(image_files)} image files")
+
+    # Step 1: Create single global 256-color palette from all frames
+    palette = create_memtext_256_color_palette(image_files)
+
+    frames_data = []
+
+    if n_coherence > 0:
+        # Two-pass: scan all frames for canonical patterns, compute coherence, then process
+        print("Pass 1: Extracting canonical patterns from all frames...")
+        all_frame_tiles = []
+        all_frame_canonical_sets = []
+        for frame_idx, image_file in enumerate(image_files):
+            print(f"  Pre-scan frame {frame_idx + 1}/{len(image_files)}: {os.path.basename(image_file)}")
+            image = load_and_scale_image(image_file)
+            frame_tiles = extract_frame_tiles(image)
+            all_frame_tiles.append(frame_tiles)
+            canonical_set = extract_canonical_patterns(frame_tiles, palette)
+            all_frame_canonical_sets.append(canonical_set)
+
+        coherence_medoids = compute_coherence_medoids(all_frame_canonical_sets, n_coherence)
+
+        print("Pass 2: Per-frame medoid derivation with coherence...")
+        for frame_idx in range(len(image_files)):
+            print(f"  Processing frame {frame_idx + 1}/{len(image_files)}...")
+            frame_tiles = all_frame_tiles[frame_idx]
+            frame_canonical = all_frame_canonical_sets[frame_idx]
+
+            combined_medoids = derive_medoids_with_coherence(frame_canonical, 512, coherence_medoids)
+            font_sets_local = [combined_medoids[i * 256:(i + 1) * 256] for i in range(2)]
+
+            tile_assignments = assign_tiles_to_medoids(frame_tiles, palette, combined_medoids)
+
+            frames_data.append({
+                'width': 640,
+                'height': 480,
+                'use_single_row_blocks': False,
+                'memtext': True,
+                'tile_assignments': tile_assignments,
+                'palette': palette,
+                'font_sets': font_sets_local,
+                'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
+                'lut_id': 0,
+            })
+    else:
+        # Original single-pass: per-frame medoids without coherence
+        for frame_idx, image_file in enumerate(image_files):
+            print(f"Processing frame {frame_idx + 1}/{len(image_files)}: {os.path.basename(image_file)}")
+            image = load_and_scale_image(image_file)
+            frame_tiles = extract_frame_tiles(image)
+
+            clustered_medoids = derive_medoids_from_tiles(frame_tiles, 512, palette)
+            font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
+
+            tile_assignments = assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids)
+
+            frames_data.append({
+                'width': 640,
+                'height': 480,
+                'use_single_row_blocks': False,
+                'memtext': True,
+                'tile_assignments': tile_assignments,
+                'palette': palette,
+                'font_sets': font_sets_local,
+                'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
+                'lut_id': 0,
+            })
+
+    # Store global palette in first frame for output
+    frames_data[0]['global_palette'] = palette
+
+    return frames_data
+
+
+def process_animation_frames_memtext_frame(input_dir, n_coherence=0):
+    """Process animation frames in MEMTEXT frame mode.
+
+    Frame mode characteristics:
+    - Per-frame 256-color palette (chunk type 0x01)
+    - Per-frame 512 medoids split into 2 font sets of 256 (chunk type 0x02)
+    - LUT chunk IDs alternate between 0 and 1 for double buffering
+    - Font set IDs alternate between pairs (0,1) and (2,3)
+    - Optional coherence medoids for cross-frame temporal stability
+    """
+    image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp', '*.tiff']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(input_dir, ext)))
+        image_files.extend(glob.glob(os.path.join(input_dir, ext.upper())))
+    image_files = sorted(image_files)
+
+    if not image_files:
+        print(f"Error: No image files found in directory {input_dir}")
+        return []
+
+    print(f"Found {len(image_files)} image files")
+
+    frames_data = []
+
+    if n_coherence > 0:
+        # Two-pass: scan all frames for canonical patterns, compute coherence, then process
+        # Font bit patterns are palette-independent (luminance-based), so we use a
+        # neutral palette for the pre-scan pass.
+        neutral_palette = np.zeros((256, 3), dtype=np.uint8)
+        for i in range(256):
+            neutral_palette[i] = [i, i, i]
+
+        print("Pass 1: Extracting canonical patterns from all frames...")
+        all_scaled_images = []
+        all_frame_tiles = []
+        all_frame_canonical_sets = []
+        for frame_idx, image_file in enumerate(image_files):
+            print(f"  Pre-scan frame {frame_idx + 1}/{len(image_files)}: {os.path.basename(image_file)}")
+            image = load_and_scale_image(image_file)
+            frame_tiles = extract_frame_tiles(image)
+            all_scaled_images.append(image)
+            all_frame_tiles.append(frame_tiles)
+            canonical_set = extract_canonical_patterns(frame_tiles, neutral_palette)
+            all_frame_canonical_sets.append(canonical_set)
+
+        coherence_medoids = compute_coherence_medoids(all_frame_canonical_sets, n_coherence)
+
+        print("Pass 2: Per-frame processing with coherence...")
+        for frame_idx in range(len(image_files)):
+            print(f"  Processing frame {frame_idx + 1}/{len(image_files)}...")
+            image = all_scaled_images[frame_idx]
+            frame_tiles = all_frame_tiles[frame_idx]
+            frame_canonical = all_frame_canonical_sets[frame_idx]
+
+            palette = create_memtext_256_color_palette_from_image(image)
+
+            combined_medoids = derive_medoids_with_coherence(frame_canonical, 512, coherence_medoids)
+            font_sets_local = [combined_medoids[i * 256:(i + 1) * 256] for i in range(2)]
+
+            tile_assignments = assign_tiles_to_medoids(frame_tiles, palette, combined_medoids)
+
+            frames_data.append({
+                'width': 640,
+                'height': 480,
+                'use_single_row_blocks': False,
+                'memtext': True,
+                'tile_assignments': tile_assignments,
+                'palette': palette,
+                'font_sets': font_sets_local,
+                'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
+                'lut_id': frame_idx % 2,
+            })
+    else:
+        # Original single-pass: per-frame everything
+        for frame_idx, image_file in enumerate(image_files):
+            print(f"Processing frame {frame_idx + 1}/{len(image_files)}: {os.path.basename(image_file)}")
+            image = load_and_scale_image(image_file)
+
+            palette = create_memtext_256_color_palette_from_image(image)
+            frame_tiles = extract_frame_tiles(image)
+
+            clustered_medoids = derive_medoids_from_tiles(frame_tiles, 512, palette)
+            font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
+
+            tile_assignments = assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids)
+
+            frames_data.append({
+                'width': 640,
+                'height': 480,
+                'use_single_row_blocks': False,
+                'memtext': True,
+                'tile_assignments': tile_assignments,
+                'palette': palette,
+                'font_sets': font_sets_local,
+                'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
+                'lut_id': frame_idx % 2,
+            })
+
     return frames_data
 
 
@@ -711,7 +1145,7 @@ def optimize_character_memtext(char_img, palette):
     
     return font_def, fg_idx, bg_idx
 
-def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=False):
+def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=False, encoding_mode='global'):
     """Save binary output in MEMTEXT format.
     
     Key differences from regular format:
@@ -721,9 +1155,10 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
     """
     print(f"Saving MEMTEXT binary to {output_bin}...")
     
-    # Get global data from first frame
-    palette = frames_data[0]['global_palette']
-    font_sets = frames_data[0]['global_font_sets']
+    if encoding_mode in ('global', 'hybrid'):
+        palette = frames_data[0]['global_palette']
+        if encoding_mode == 'global':
+            font_sets = frames_data[0]['global_font_sets']
     
     # Header
     magic = 0xA8
@@ -739,27 +1174,25 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
         # Write header: 8 bytes
         f.write(struct.pack('BBBBBBBB', magic, version, frame_duration_byte, mode, columns, rows, xoffset, yoffset))
         
-        # Write Text Color LUT for MEMTEXT (chunk type 0x01, 2048 bytes)
-        # FG and BG are identical, each 256 colors * 4 bytes = 1024 bytes
-        # Total = 2048 bytes
-        palette_bgra = np.zeros((256, 4), dtype=np.uint8)
-        palette_bgra[:, 0] = palette[:, 2]  # B
-        palette_bgra[:, 1] = palette[:, 1]  # G
-        palette_bgra[:, 2] = palette[:, 0]  # R
-        palette_bgra[:, 3] = 255            # A
-        palette_bgra[0, 3] = 0              # Transparent for index 0
-        
-        lut_data = palette_bgra.tobytes() + palette_bgra.tobytes()  # FG + BG (identical)
-        f.write(struct.pack('BBH', 0x01, 0x00, len(lut_data)))
-        f.write(lut_data)
-        
-        # Write 4 Font Data chunks (chunk type 0x02, chunk ID = font set id)
-        for fs_id in range(4):
-            font_data = font_sets[fs_id].astype(np.uint8).tobytes()
-            if len(font_data) < 2048:
-                font_data += b'\x00' * (2048 - len(font_data))
-            f.write(struct.pack('BBH', 0x02, fs_id, len(font_data)))
-            f.write(font_data)
+        if encoding_mode in ('global', 'hybrid'):
+            palette_bgra = np.zeros((256, 4), dtype=np.uint8)
+            palette_bgra[:, 0] = palette[:, 2]
+            palette_bgra[:, 1] = palette[:, 1]
+            palette_bgra[:, 2] = palette[:, 0]
+            palette_bgra[:, 3] = 255
+            palette_bgra[0, 3] = 0
+
+            lut_data = palette_bgra.tobytes() + palette_bgra.tobytes()
+            f.write(struct.pack('BBH', 0x01, 0x00, len(lut_data)))
+            f.write(lut_data)
+
+            if encoding_mode == 'global':
+                for fs_id in range(4):
+                    font_data = font_sets[fs_id].astype(np.uint8).tobytes()
+                    if len(font_data) < 2048:
+                        font_data += b'\x00' * (2048 - len(font_data))
+                    f.write(struct.pack('BBH', 0x02, fs_id, len(font_data)))
+                    f.write(font_data)
         
         # Write frames
         for frame_idx, frame_data in enumerate(frames_data):
@@ -767,6 +1200,45 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
             
             # Frame Start
             f.write(struct.pack('BBH', 0x00, 0x00, 0))
+
+            if encoding_mode == 'frame':
+                frame_palette = frame_data['palette']
+                frame_font_sets = frame_data['font_sets']
+                lut_id = frame_data.get('lut_id', frame_idx % 2)
+                font_id_base = frame_data.get('font_id_base', 0 if (frame_idx % 2 == 0) else 2)
+
+                palette_bgra = np.zeros((256, 4), dtype=np.uint8)
+                palette_bgra[:, 0] = frame_palette[:, 2]
+                palette_bgra[:, 1] = frame_palette[:, 1]
+                palette_bgra[:, 2] = frame_palette[:, 0]
+                palette_bgra[:, 3] = 255
+                palette_bgra[0, 3] = 0
+
+                lut_data = palette_bgra.tobytes() + palette_bgra.tobytes()
+                f.write(struct.pack('BBH', 0x01, lut_id & 0x01, len(lut_data)))
+                f.write(lut_data)
+
+                for local_fs in range(2):
+                    font_data = frame_font_sets[local_fs].astype(np.uint8).tobytes()
+                    if len(font_data) < 2048:
+                        font_data += b'\x00' * (2048 - len(font_data))
+                    f.write(struct.pack('BBH', 0x02, (font_id_base + local_fs) & 0x03, len(font_data)))
+                    f.write(font_data)
+            elif encoding_mode == 'hybrid':
+                # Hybrid: no per-frame palette, only per-frame font sets
+                frame_font_sets = frame_data['font_sets']
+                font_id_base = frame_data.get('font_id_base', 0 if (frame_idx % 2 == 0) else 2)
+                lut_id = 0  # Always LUT 0 (FPGA LUT 1 bug workaround)
+
+                for local_fs in range(2):
+                    font_data = frame_font_sets[local_fs].astype(np.uint8).tobytes()
+                    if len(font_data) < 2048:
+                        font_data += b'\x00' * (2048 - len(font_data))
+                    f.write(struct.pack('BBH', 0x02, (font_id_base + local_fs) & 0x03, len(font_data)))
+                    f.write(font_data)
+            else:
+                font_id_base = 0
+                lut_id = 0
             
             tile_assignments = frame_data['tile_assignments']  # (4800, 5)
             
@@ -778,11 +1250,26 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
             char_data = []
             for i in range(len(tile_assignments)):
                 fs = tile_assignments[i, 0]
+                if encoding_mode in ('frame', 'hybrid'):
+                    fs = (font_id_base + fs) & 0x03
                 char_idx = tile_assignments[i, 1]
                 invert = tile_assignments[i, 4]
-                # Per spec: low byte [7:0] = CHARACTER, high byte [8:9] = FONT BANK, [12] = INVERT
-                # Bit positions in high byte: [0:1] = font bank (bits 8-9), [4] = invert (bit 12)
-                high_byte = (fs & 0x03) | ((invert & 0x01) << 4)
+                # Per spec:
+                #   bits [8:9]   = font bank
+                #   bits [10:11] = combined LUT select for both FG/BG
+                #                  00 -> LUT0, 01 -> LUT1
+                #                  10/11 are not used
+                #   bit  [12]    = invert
+                # High byte mapping:
+                #   bit0..1 -> word bits8..9
+                #   bit2..3 -> word bits10..11 (LUT select)
+                #   bit4    -> word bit12
+                lut_sel = lut_id & 0x01
+                high_byte = (
+                    (fs & 0x03)
+                    | ((lut_sel & 0x01) << 2)
+                    | ((invert & 0x01) << 4)
+                )
                 word = (char_idx & 0xFF) | (high_byte << 8)
                 char_data.append(word & 0xFF)
                 char_data.append((word >> 8) & 0xFF)

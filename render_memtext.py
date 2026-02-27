@@ -156,75 +156,9 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
         if mode != 0x02:
             raise ValueError(f"Expected MEMTEXT mode (0x02), got {mode:02X}")
         
-        # Parse initial chunks (palette and fonts)
-        palette = None  # 256-color palette
-        font_sets = [None, None, None, None]  # 4 font sets
-        
-        while True:
-            pos = f.tell()
-            chunk = parse_chunk_header(f)
-            if chunk is None:
-                break
-            
-            chunk_type, chunk_id, chunk_length = chunk
-            
-            if chunk_type == 0x01:
-                # Text Color LUT
-                if chunk_length == 2048:
-                    # MEMTEXT: 256 colors * 4 bytes * 2 (FG + BG)
-                    lut_data = f.read(chunk_length)
-                    # Parse FG palette (first 1024 bytes)
-                    palette = []
-                    for i in range(256):
-                        offset = i * 4
-                        b, g, r, a = lut_data[offset:offset+4]
-                        palette.append((r, g, b, a))
-                    print(f"Loaded 256-color MEMTEXT palette")
-                elif chunk_length == 128:
-                    # Standard: 16 FG + 16 BG colors
-                    lut_data = f.read(chunk_length)
-                    palette = []
-                    for i in range(32):
-                        offset = i * 4
-                        b, g, r, a = lut_data[offset:offset+4]
-                        palette.append((r, g, b, a))
-                    # Expand to 256 for consistency
-                    while len(palette) < 256:
-                        palette.append((0, 0, 0, 255))
-                    print(f"Loaded 32-color standard palette")
-                else:
-                    print(f"Warning: Unexpected LUT length {chunk_length}, skipping")
-                    f.read(chunk_length)
-            
-            elif chunk_type == 0x02:
-                # Text Font Data
-                font_data = f.read(chunk_length)
-                if chunk_length == 2048:
-                    # Parse 256 x 8-byte patterns
-                    patterns = np.frombuffer(font_data, dtype=np.uint8).reshape(256, 8)
-                    font_sets[chunk_id] = patterns
-                    print(f"Loaded font set {chunk_id} (256 patterns)")
-                else:
-                    print(f"Warning: Unexpected font length {chunk_length} for set {chunk_id}")
-            
-            elif chunk_type == 0x00:
-                # Frame Start - rewind and process frames
-                f.seek(pos)
-                break
-            
-            else:
-                # Skip unknown chunk
-                print(f"Skipping unknown chunk type {chunk_type:02X}")
-                f.read(chunk_length)
-        
-        if palette is None:
-            raise ValueError("No palette found in file")
-        
-        # Check if this is MEMTEXT mode based on palette size and font sets
-        is_memtext = font_sets[0] is not None and font_sets[1] is not None
-        print(f"Mode: {'MEMTEXT' if is_memtext else 'Standard text'}")
-        
-        # Process frames
+        palette_sets = [None, None]
+        font_sets = [None, None, None, None]
+
         frame_idx = 0
         while True:
             chunk = parse_chunk_header(f)
@@ -232,11 +166,60 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                 break
             
             chunk_type, chunk_id, chunk_length = chunk
+
+            if chunk_type == 0x01:
+                if chunk_length == 2048:
+                    lut_data = f.read(chunk_length)
+                    palette = []
+                    for i in range(256):
+                        offset = i * 4
+                        b, g, r, a = lut_data[offset:offset+4]
+                        palette.append((r, g, b, a))
+                    palette_sets[chunk_id & 0x01] = palette
+                    print(f"Loaded MEMTEXT palette (LUT ID {chunk_id})")
+                elif chunk_length == 128:
+                    lut_data = f.read(chunk_length)
+                    palette = []
+                    for i in range(32):
+                        offset = i * 4
+                        b, g, r, a = lut_data[offset:offset+4]
+                        palette.append((r, g, b, a))
+                    while len(palette) < 256:
+                        palette.append((0, 0, 0, 255))
+                    palette_sets[0] = palette
+                    palette_sets[1] = palette
+                    print(f"Loaded standard palette (LUT ID {chunk_id})")
+                else:
+                    print(f"Warning: Unexpected LUT length {chunk_length}, skipping")
+                    f.read(chunk_length)
+                continue
+
+            if chunk_type == 0x02:
+                font_data = f.read(chunk_length)
+                if chunk_length == 2048 and chunk_id < 4:
+                    patterns = np.frombuffer(font_data, dtype=np.uint8).reshape(256, 8)
+                    font_sets[chunk_id] = patterns
+                    print(f"Loaded font set {chunk_id} (256 patterns)")
+                else:
+                    print(f"Warning: Unexpected font length {chunk_length} for set {chunk_id}")
+                continue
+
+            if chunk_type == 0x07:
+                rle_data = f.read(chunk_length)
+                if chunk_id < 4:
+                    font_data = rle_decode_bytes(rle_data, 2048)
+                    if len(font_data) == 2048:
+                        patterns = np.frombuffer(font_data, dtype=np.uint8).reshape(256, 8)
+                        font_sets[chunk_id] = patterns
+                        print(f"Loaded RLE font set {chunk_id} (256 patterns)")
+                continue
             
             if chunk_type != 0x00:
-                # Not a frame start, rewind and skip
-                f.seek(f.tell() - 4)
-                break
+                print(f"Skipping unknown chunk type {chunk_type:02X}")
+                f.read(chunk_length)
+                continue
+
+            is_memtext = (mode == 0x02)
             
             # Frame Start
             print(f"Processing frame {frame_idx}...")
@@ -244,8 +227,6 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
             # Collect frame data
             char_data = []
             color_data = []
-            frame_fonts = [None, None, None, None]
-            
             while True:
                 chunk = parse_chunk_header(f)
                 if chunk is None:
@@ -256,20 +237,43 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                 if chunk_type == 0xFF:
                     # Frame End
                     break
+
+                elif chunk_type == 0x01:
+                    if chunk_length == 2048:
+                        lut_data = f.read(chunk_length)
+                        palette = []
+                        for i in range(256):
+                            offset = i * 4
+                            b, g, r, a = lut_data[offset:offset+4]
+                            palette.append((r, g, b, a))
+                        palette_sets[chunk_id & 0x01] = palette
+                    elif chunk_length == 128:
+                        lut_data = f.read(chunk_length)
+                        palette = []
+                        for i in range(32):
+                            offset = i * 4
+                            b, g, r, a = lut_data[offset:offset+4]
+                            palette.append((r, g, b, a))
+                        while len(palette) < 256:
+                            palette.append((0, 0, 0, 255))
+                        palette_sets[0] = palette
+                        palette_sets[1] = palette
+                    else:
+                        f.read(chunk_length)
                 
                 elif chunk_type == 0x02:
-                    # Per-frame font data (for non-global-font mode)
                     font_data = f.read(chunk_length)
-                    if chunk_length == 2048:
+                    if chunk_length == 2048 and chunk_id < 4:
                         patterns = np.frombuffer(font_data, dtype=np.uint8).reshape(256, 8)
-                        frame_fonts[chunk_id] = patterns
+                        font_sets[chunk_id] = patterns
                 
                 elif chunk_type == 0x07:
-                    # RLE Font Data
                     rle_data = f.read(chunk_length)
-                    font_data = rle_decode_bytes(rle_data, 2048)
-                    patterns = np.frombuffer(font_data, dtype=np.uint8).reshape(256, 8)
-                    frame_fonts[chunk_id] = patterns
+                    if chunk_id < 4:
+                        font_data = rle_decode_bytes(rle_data, 2048)
+                        if len(font_data) == 2048:
+                            patterns = np.frombuffer(font_data, dtype=np.uint8).reshape(256, 8)
+                            font_sets[chunk_id] = patterns
                 
                 elif chunk_type == 0x03:
                     # Fixed Frame Character
@@ -285,9 +289,8 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                     # RLE Frame Character
                     rle_data = f.read(chunk_length)
                     if is_memtext:
-                        # Word-based RLE: chunks have 1024 or 704 words
-                        chunk_word_counts = [1024] * 4 + [704]
-                        decoded = rle_decode_memtext(rle_data, chunk_word_counts[chunk_id])
+                        chunk_words = 704 if chunk_id >= 4 else 1024
+                        decoded = rle_decode_memtext(rle_data, chunk_words)
                         # Convert back to bytes
                         data = bytes([b for w in decoded for b in w])
                     else:
@@ -299,9 +302,8 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                     # RLE Frame Color
                     rle_data = f.read(chunk_length)
                     if is_memtext:
-                        # Word-based RLE: chunks have 1024 or 704 words
-                        chunk_word_counts = [1024] * 4 + [704]
-                        decoded = rle_decode_memtext(rle_data, chunk_word_counts[chunk_id])
+                        chunk_words = 704 if chunk_id >= 4 else 1024
+                        decoded = rle_decode_memtext(rle_data, chunk_words)
                         data = bytes([b for w in decoded for b in w])
                     else:
                         data = rle_decode_bytes(rle_data, 4800)
@@ -311,20 +313,23 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                     # Skip unknown
                     f.read(chunk_length)
             
-            # Use per-frame fonts if provided, otherwise use global
-            active_fonts = [frame_fonts[i] if frame_fonts[i] is not None else font_sets[i] for i in range(4)]
+            active_fonts = font_sets
             
             # Combine chunks
             all_char = b''.join(char_data)
             all_color = b''.join(color_data)
+
+            if palette_sets[0] is None and palette_sets[1] is None:
+                raise ValueError(f"No palette available while rendering frame {frame_idx}")
             
             # Render frame
             output_path = os.path.join(output_dir, f'reconstructed_{frame_idx:04d}.png')
             
             if is_memtext:
-                render_memtext_frame(all_char, all_color, active_fonts, palette, 
+                render_memtext_frame(all_char, all_color, active_fonts, palette_sets,
                                     columns, rows, output_path)
             else:
+                palette = palette_sets[0] if palette_sets[0] is not None else palette_sets[1]
                 render_standard_text_frame(all_char, all_color, active_fonts[0], palette,
                                           columns, rows, output_path)
             
@@ -338,15 +343,16 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
         return frame_idx
 
 
-def render_memtext_frame(char_data, color_data, font_sets, palette, columns, rows, output_path):
+def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns, rows, output_path):
     """Render a single MEMTEXT frame.
     
-    char_data: bytes with 2 bytes per tile: [char_index, (font_set:2 | invert_at_bit4)]
-               Per spec: low byte [7:0] = CHARACTER, high byte [8:9] = FONT BANK, [12] = INVERT
+    char_data: bytes with 2 bytes per tile
+               Per spec: low byte [7:0] = CHARACTER, high byte bits:
+               [8:9]=FONT BANK, [10:11]=combined LUT select, [12]=INVERT
     color_data: bytes with 2 bytes per tile: [bg_idx, fg_idx]
                Per spec: low byte [7:0] = BACKGROUND, high byte [15:8] = FOREGROUND
     font_sets: list of 4 numpy arrays, each (256, 8)
-    palette: list of 256 (r, g, b, a) tuples
+    palette_sets: list with LUT set 0 and 1 (each list of 256 (r, g, b, a) tuples)
     """
     cell_size = 8
     img_width = columns * cell_size
@@ -363,6 +369,7 @@ def render_memtext_frame(char_data, color_data, font_sets, palette, columns, row
         char_idx = char_data[tile_idx * 2]
         info_byte = char_data[tile_idx * 2 + 1]
         font_set_id = info_byte & 0x03          # bits [0:1] of high byte (bits 8-9)
+        lut_sel = (info_byte >> 2) & 0x03       # bits [2:3] of high byte (bits 10-11)
         invert = (info_byte >> 4) & 0x01        # bit 4 of high byte (bit 12)
         
         # Parse color data: bg in low byte, fg in high byte
@@ -381,9 +388,21 @@ def render_memtext_frame(char_data, color_data, font_sets, palette, columns, row
         
         pattern = font_sets[font_set_id][char_idx]
         
-        # Get colors
-        fg_color = palette[fg_idx][:3]
-        bg_color = palette[bg_idx][:3]
+        # Use combined LUT selector for both FG and BG.
+        # Valid selectors are 0 (00) and 1 (01). Any other value falls back to LUT0.
+        if lut_sel > 1:
+            lut_sel = 0
+        fg_palette = palette_sets[lut_sel]
+        if fg_palette is None:
+            fg_palette = palette_sets[1 - lut_sel]
+        bg_palette = palette_sets[lut_sel]
+        if bg_palette is None:
+            bg_palette = palette_sets[1 - lut_sel]
+        if fg_palette is None or bg_palette is None:
+            continue
+
+        fg_color = fg_palette[fg_idx][:3]
+        bg_color = bg_palette[bg_idx][:3]
         
         # Calculate tile position
         tile_row = tile_idx // columns

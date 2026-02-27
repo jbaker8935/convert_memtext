@@ -25,6 +25,16 @@ This will convert 'videofile.mp4' to a series of numbered png files in the 'outp
 
 ```python convert_memtext.py --animation input_dir --output-bin filename.bin```
 
+Frame-local encoding (per-frame palette + 512 medoids, with alternating LUT/font IDs for double buffering):
+
+```python convert_memtext.py --animation input_dir --output-bin filename.bin --encoding-mode frame```
+
+Hybrid encoding (global palette + per-frame 512 medoids, with alternating font IDs for double buffering):
+
+```python convert_memtext.py --animation input_dir --output-bin filename.bin --encoding-mode hybrid```
+
+The Frame and Hybrid modes are experimental and will increase file size.  Frame mode does not currently work on the hardware  Exeriment with hybrid mode.   Generally the default global mode is the best encoding-mode, but hybrid may be perceptually better for some content. 
+
 If you want to see the reconstructed images on your host the render_memtext.py tool can take a bin file and show you what each frame will look like when output by the anim_memtext.pgz.
 
 ```python render_memtext.py animation.bin  output_dir```
