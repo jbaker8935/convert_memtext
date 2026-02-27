@@ -23,6 +23,8 @@ This will convert 'videofile.mp4' to a series of numbered png files in the 'outp
 
 ## Converting
 
+Default global encoding (global palette + global 1024 medoids)
+
 ```python convert_memtext.py --animation input_dir --output-bin filename.bin```
 
 Hybrid encoding (global palette + per-frame 512 medoids, with alternating font IDs for double buffering):
