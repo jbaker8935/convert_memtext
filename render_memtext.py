@@ -156,7 +156,8 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
         if mode != 0x02:
             raise ValueError(f"Expected MEMTEXT mode (0x02), got {mode:02X}")
         
-        palette_sets = [None, None]
+        palette_sets = [None, None]       # FG palettes per LUT id
+        bg_palette_sets = [None, None]   # BG palettes per LUT id
         font_sets = [None, None, None, None]
 
         frame_idx = 0
@@ -170,12 +171,18 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
             if chunk_type == 0x01:
                 if chunk_length == 2048:
                     lut_data = f.read(chunk_length)
-                    palette = []
+                    fg_palette = []
                     for i in range(256):
                         offset = i * 4
                         b, g, r, a = lut_data[offset:offset+4]
-                        palette.append((r, g, b, a))
-                    palette_sets[chunk_id & 0x01] = palette
+                        fg_palette.append((r, g, b, a))
+                    bg_palette = []
+                    for i in range(256):
+                        offset = 1024 + i * 4
+                        b, g, r, a = lut_data[offset:offset+4]
+                        bg_palette.append((r, g, b, a))
+                    palette_sets[chunk_id & 0x01] = fg_palette
+                    bg_palette_sets[chunk_id & 0x01] = bg_palette
                     print(f"Loaded MEMTEXT palette (LUT ID {chunk_id})")
                 elif chunk_length == 128:
                     lut_data = f.read(chunk_length)
@@ -188,6 +195,8 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                         palette.append((0, 0, 0, 255))
                     palette_sets[0] = palette
                     palette_sets[1] = palette
+                    bg_palette_sets[0] = palette
+                    bg_palette_sets[1] = palette
                     print(f"Loaded standard palette (LUT ID {chunk_id})")
                 else:
                     print(f"Warning: Unexpected LUT length {chunk_length}, skipping")
@@ -241,12 +250,18 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                 elif chunk_type == 0x01:
                     if chunk_length == 2048:
                         lut_data = f.read(chunk_length)
-                        palette = []
+                        fg_palette = []
                         for i in range(256):
                             offset = i * 4
                             b, g, r, a = lut_data[offset:offset+4]
-                            palette.append((r, g, b, a))
-                        palette_sets[chunk_id & 0x01] = palette
+                            fg_palette.append((r, g, b, a))
+                        bg_palette = []
+                        for i in range(256):
+                            offset = 1024 + i * 4
+                            b, g, r, a = lut_data[offset:offset+4]
+                            bg_palette.append((r, g, b, a))
+                        palette_sets[chunk_id & 0x01] = fg_palette
+                        bg_palette_sets[chunk_id & 0x01] = bg_palette
                     elif chunk_length == 128:
                         lut_data = f.read(chunk_length)
                         palette = []
@@ -258,6 +273,8 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                             palette.append((0, 0, 0, 255))
                         palette_sets[0] = palette
                         palette_sets[1] = palette
+                        bg_palette_sets[0] = palette
+                        bg_palette_sets[1] = palette
                     else:
                         f.read(chunk_length)
                 
@@ -327,7 +344,7 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
             
             if is_memtext:
                 render_memtext_frame(all_char, all_color, active_fonts, palette_sets,
-                                    columns, rows, output_path)
+                                    columns, rows, output_path, bg_palette_sets=bg_palette_sets)
             else:
                 palette = palette_sets[0] if palette_sets[0] is not None else palette_sets[1]
                 render_standard_text_frame(all_char, all_color, active_fonts[0], palette,
@@ -343,7 +360,7 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
         return frame_idx
 
 
-def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns, rows, output_path):
+def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns, rows, output_path, bg_palette_sets=None):
     """Render a single MEMTEXT frame.
     
     char_data: bytes with 2 bytes per tile
@@ -352,8 +369,12 @@ def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns
     color_data: bytes with 2 bytes per tile: [bg_idx, fg_idx]
                Per spec: low byte [7:0] = BACKGROUND, high byte [15:8] = FOREGROUND
     font_sets: list of 4 numpy arrays, each (256, 8)
-    palette_sets: list with LUT set 0 and 1 (each list of 256 (r, g, b, a) tuples)
+    palette_sets: list with FG LUT set 0 and 1 (each list of 256 (r, g, b, a) tuples)
+    bg_palette_sets: list with BG LUT set 0 and 1.  If None, same as palette_sets.
     """
+    if bg_palette_sets is None:
+        bg_palette_sets = palette_sets
+
     cell_size = 8
     img_width = columns * cell_size
     img_height = rows * cell_size
@@ -395,9 +416,9 @@ def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns
         fg_palette = palette_sets[lut_sel]
         if fg_palette is None:
             fg_palette = palette_sets[1 - lut_sel]
-        bg_palette = palette_sets[lut_sel]
+        bg_palette = bg_palette_sets[lut_sel]
         if bg_palette is None:
-            bg_palette = palette_sets[1 - lut_sel]
+            bg_palette = bg_palette_sets[1 - lut_sel]
         if fg_palette is None or bg_palette is None:
             continue
 

@@ -211,6 +211,13 @@ def main():
         action='store_true',
         help='Use reconstruction-error search for tile assignment. Evaluates multiple palette-color candidates and selects the combination that minimises pixel-level error. Slower but produces better visual quality.'
     )
+    parser.add_argument(
+        '--split-palette',
+        action='store_true',
+        help='Use separate 256-color palettes for foreground and background (512 total colors). '
+             'Provides better color fidelity for most animations.'
+
+    )
     args = parser.parse_args()
 
     print("K2 Memtext Image Converter")
@@ -219,26 +226,29 @@ def main():
     print(f"Processing directory: {args.animation}")
     n_coherence = args.coherence_medoids
     high_quality = args.high_quality
+    split_palette = args.split_palette
     if high_quality:
         print("  High quality: ON (reconstruction-error tile matching)")
+    if split_palette:
+        print("  Split palette: ON (256 FG + 256 BG = 512 total colors)")
     if args.encoding_mode == 'global':
         if n_coherence > 0:
             print("Note: --coherence-medoids is ignored in global mode (all medoids are already global)")
         print("MEMTEXT global mode: 256-color palette, 1024 medoids in 4 font sets, shared across all frames")
         frames_data = process_animation_frames_memtext_global(
-            args.animation, high_quality=high_quality)
+            args.animation, high_quality=high_quality, split_palette=split_palette)
     elif args.encoding_mode == 'hybrid':
         print("MEMTEXT hybrid mode: global 256-color palette, per-frame 512 medoids in 2 font sets")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
         frames_data = process_animation_frames_memtext_hybrid(
-            args.animation, n_coherence=n_coherence, high_quality=high_quality)
+            args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette)
     else:
         print("MEMTEXT frame mode: per-frame 256-color palette, 512 medoids in 2 font sets, double-buffered LUT/font IDs")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
         frames_data = process_animation_frames_memtext_frame(
-            args.animation, n_coherence=n_coherence, high_quality=high_quality)
+            args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette)
 
     if not frames_data:
         print("Error: No frames processed successfully")
@@ -405,6 +415,88 @@ def create_memtext_256_color_palette_from_image(image):
     return palette
 
 
+def _split_tile_fg_bg_centers(img_np):
+    """Compute per-tile FG/BG average colors using luminance median split.
+
+    Args:
+        img_np: (H, W, 3) float32 image array (must be 640×480).
+
+    Returns:
+        (fg_centers, bg_centers) – each a list of (3,) float32 arrays.
+    """
+    fg_centers = []
+    bg_centers = []
+    for by in range(0, 480, 8):
+        for bx in range(0, 640, 8):
+            tile = img_np[by:by + 8, bx:bx + 8].reshape(-1, 3)
+            lum = 0.299 * tile[:, 0] + 0.587 * tile[:, 1] + 0.114 * tile[:, 2]
+            threshold = np.median(lum)
+            fg_mask = lum >= threshold
+            bg_mask = ~fg_mask
+            fg_centers.append(tile[fg_mask].mean(axis=0) if fg_mask.any() else tile.mean(axis=0))
+            bg_centers.append(tile[bg_mask].mean(axis=0) if bg_mask.any() else tile.mean(axis=0))
+    return fg_centers, bg_centers
+
+
+def _cluster_centers_to_palette(centers_arr, label):
+    """Cluster a set of color centers to a 256-entry palette (index 0 reserved)."""
+    unique = np.unique(centers_arr.astype(np.uint8), axis=0).astype(np.float32)
+    n = min(255, len(unique))
+    palette = np.zeros((256, 3), dtype=np.uint8)
+    if n < 255:
+        palette[1:n + 1] = unique[:n].astype(np.uint8)
+        for i in range(n + 1, 256):
+            palette[i] = [128, 128, 128]
+    else:
+        kmeans = make_kmeans(n_clusters=255, random_state=42, n_init=10)
+        kmeans.fit(unique)
+        palette[1:256] = kmeans.cluster_centers_.astype(np.uint8)
+    return palette
+
+
+def create_memtext_512_color_palette(image_files):
+    """Create separate 256-color FG and BG palettes using role-aware clustering.
+
+    For each 8×8 tile across all frames, pixels are split by luminance median
+    into foreground (bright) and background (dark) groups.  The per-tile average
+    of each group is collected, then clustered independently to produce
+    role-specific palettes.  Index 0 is reserved for transparency in both.
+
+    Returns: (fg_palette, bg_palette) each np.array of shape (256, 3), dtype=uint8
+    """
+    print("Creating 512-color split palette (256 FG + 256 BG)...")
+
+    all_fg = []
+    all_bg = []
+
+    for idx, image_file in enumerate(image_files):
+        img = load_and_scale_image(image_file)
+        img_np = np.array(img, dtype=np.float32)
+        fg_c, bg_c = _split_tile_fg_bg_centers(img_np)
+        all_fg.extend(fg_c)
+        all_bg.extend(bg_c)
+
+    all_fg = np.array(all_fg, dtype=np.float32)
+    all_bg = np.array(all_bg, dtype=np.float32)
+    print(f"  Collected {len(all_fg)} FG centres and {len(all_bg)} BG centres from {len(image_files)} frames")
+
+    fg_palette = _cluster_centers_to_palette(all_fg, "FG")
+    bg_palette = _cluster_centers_to_palette(all_bg, "BG")
+
+    print("  Created FG palette (255 colors + transparent) and BG palette (255 colors + transparent)")
+    return fg_palette, bg_palette
+
+
+def create_memtext_512_color_palette_from_image(image):
+    """Create separate 256-color FG and BG palettes from one scaled frame."""
+    img_np = np.array(image, dtype=np.float32)
+    fg_c, bg_c = _split_tile_fg_bg_centers(img_np)
+
+    fg_palette = _cluster_centers_to_palette(np.array(fg_c, dtype=np.float32), "FG")
+    bg_palette = _cluster_centers_to_palette(np.array(bg_c, dtype=np.float32), "BG")
+    return fg_palette, bg_palette
+
+
 def extract_frame_tiles(image):
     """Extract 8x8 MEMTEXT tiles and source pixels from a scaled frame image."""
     img_np = np.array(image)
@@ -503,6 +595,22 @@ def derive_medoids_from_tiles(frame_tiles, n_medoids, palette):
         clustered_medoids = np.vstack([clustered_medoids, pad])
     elif len(clustered_medoids) > n_medoids:
         clustered_medoids = clustered_medoids[:n_medoids]
+
+    # Ensure medoid 0 is the all-zeros pattern (needed for flat tiles).
+    # Flat tile assignments use font_set=0, char_idx=0 → medoid 0.
+    zero_pattern = np.zeros(8, dtype=np.uint8)
+    if not np.array_equal(clustered_medoids[0], zero_pattern):
+        # Find existing zero medoid and swap it to position 0
+        found = False
+        for j in range(1, len(clustered_medoids)):
+            if np.array_equal(clustered_medoids[j], zero_pattern):
+                clustered_medoids[j] = clustered_medoids[0].copy()
+                clustered_medoids[0] = zero_pattern
+                found = True
+                break
+        if not found:
+            # No zero medoid exists; replace the least-used one at index 0
+            clustered_medoids[0] = zero_pattern
 
     return clustered_medoids
 
@@ -739,25 +847,26 @@ def _build_numba_hq_kernel():
     Numba is actually available.
     """
     @numba.njit(cache=True, parallel=True)
-    def _hq_assign_tiles(all_pixels, palette_f, medoid_bits_f, K):
+    def _hq_assign_tiles(all_pixels, fg_palette_f, bg_palette_f, medoid_bits_f, K):
         """High-quality tile assignment — Numba-compiled, parallel over tiles.
 
         Parameters
         ----------
         all_pixels    : (n_tiles, 64, 3) float32  – flattened tile pixels
-        palette_f     : (n_palette, 3) float32
+        fg_palette_f  : (n_fg_pal, 3) float32 – foreground palette
+        bg_palette_f  : (n_bg_pal, 3) float32 – background palette
         medoid_bits_f : (n_medoids, 64) float32
         K             : int – top-K palette candidates
 
         Returns
         -------
-        results : (n_tiles, 4) int32 – [best_medoid, fg_idx, bg_idx, invert]
-                  A tile is marked "flat" when fg_idx == bg_idx.
+        results : (n_tiles, 5) int32 – [best_medoid, fg_idx, bg_idx, invert, is_flat]
         """
         n_tiles = all_pixels.shape[0]
-        n_palette = palette_f.shape[0]
+        n_fg_palette = fg_palette_f.shape[0]
+        n_bg_palette = bg_palette_f.shape[0]
         n_medoids = medoid_bits_f.shape[0]
-        results = np.empty((n_tiles, 4), dtype=np.int32)
+        results = np.empty((n_tiles, 5), dtype=np.int32)
 
         for i in numba.prange(n_tiles):
             orig = all_pixels[i]  # (64, 3)
@@ -788,7 +897,7 @@ def _build_numba_hq_kernel():
                     bg_count += 1
                     bg_sum_r += orig[p, 0]; bg_sum_g += orig[p, 1]; bg_sum_b += orig[p, 2]
 
-            # Check for flat (single-colour) tile
+            # Check for flat (single-color) tile
             is_flat = True
             ref_r = orig[0, 0]; ref_g = orig[0, 1]; ref_b = orig[0, 2]
             for p in range(1, 64):
@@ -800,10 +909,10 @@ def _build_numba_hq_kernel():
                 avg_r = orig[0, 0]; avg_g = orig[0, 1]; avg_b = orig[0, 2]
                 best_c = 1  # skip palette index 0
                 best_d = np.float32(1e30)
-                for ci in range(1, n_palette):
-                    dr = palette_f[ci, 0] - avg_r
-                    dg = palette_f[ci, 1] - avg_g
-                    db = palette_f[ci, 2] - avg_b
+                for ci in range(1, n_bg_palette):
+                    dr = bg_palette_f[ci, 0] - avg_r
+                    dg = bg_palette_f[ci, 1] - avg_g
+                    db = bg_palette_f[ci, 2] - avg_b
                     d = dr * dr + dg * dg + db * db
                     if d < best_d:
                         best_d = d; best_c = ci
@@ -811,6 +920,7 @@ def _build_numba_hq_kernel():
                 results[i, 1] = best_c
                 results[i, 2] = best_c
                 results[i, 3] = 0
+                results[i, 4] = 1  # flat
                 continue
 
             fc_n = max(fg_count, 1)
@@ -828,10 +938,10 @@ def _build_numba_hq_kernel():
                 fg_top_idx[k] = -1; fg_top_d[k] = np.float32(1e30)
                 bg_top_idx[k] = -1; bg_top_d[k] = np.float32(1e30)
 
-            for ci in range(1, n_palette):  # skip index 0
-                dr = palette_f[ci, 0] - fg_cr
-                dg = palette_f[ci, 1] - fg_cg
-                db = palette_f[ci, 2] - fg_cb
+            for ci in range(1, n_fg_palette):  # skip index 0
+                dr = fg_palette_f[ci, 0] - fg_cr
+                dg = fg_palette_f[ci, 1] - fg_cg
+                db = fg_palette_f[ci, 2] - fg_cb
                 d = dr * dr + dg * dg + db * db
                 # Insertion sort into top-K (K is tiny)
                 if d < fg_top_d[K - 1]:
@@ -844,9 +954,10 @@ def _build_numba_hq_kernel():
                         else:
                             break
 
-                dr2 = palette_f[ci, 0] - bg_cr
-                dg2 = palette_f[ci, 1] - bg_cg
-                db2 = palette_f[ci, 2] - bg_cb
+            for ci in range(1, n_bg_palette):  # skip index 0
+                dr2 = bg_palette_f[ci, 0] - bg_cr
+                dg2 = bg_palette_f[ci, 1] - bg_cg
+                db2 = bg_palette_f[ci, 2] - bg_cb
                 d2 = dr2 * dr2 + dg2 * dg2 + db2 * db2
                 if d2 < bg_top_d[K - 1]:
                     bg_top_d[K - 1] = d2
@@ -858,7 +969,7 @@ def _build_numba_hq_kernel():
                         else:
                             break
 
-            # --- SSE search over K×K colour pairs × n_medoids -------------
+            # --- SSE search over K×K color pairs × n_medoids -------------
             best_sse = np.float32(1e30)
             best_m = np.int32(0)
             best_fc = fg_top_idx[0]
@@ -872,12 +983,15 @@ def _build_numba_hq_kernel():
                 fc = fg_top_idx[ki]
                 if fc < 0:
                     continue
-                fgr = palette_f[fc, 0]; fgg = palette_f[fc, 1]; fgb = palette_f[fc, 2]
+                fgr = fg_palette_f[fc, 0]; fgg = fg_palette_f[fc, 1]; fgb = fg_palette_f[fc, 2]
                 for kj in range(K):
                     bc = bg_top_idx[kj]
-                    if bc < 0 or fc == bc:
+                    if bc < 0:
                         continue
-                    bgr = palette_f[bc, 0]; bgg = palette_f[bc, 1]; bgb = palette_f[bc, 2]
+                    bgr = bg_palette_f[bc, 0]; bgg = bg_palette_f[bc, 1]; bgb = bg_palette_f[bc, 2]
+                    # Skip if fg and bg are the same color (flat)
+                    if fgr == bgr and fgg == bgg and fgb == bgb:
+                        continue
 
                     diff_r = fgr - bgr; diff_g = fgg - bgg; diff_b = fgb - bgb
                     diff_sq = diff_r * diff_r + diff_g * diff_g + diff_b * diff_b
@@ -914,6 +1028,7 @@ def _build_numba_hq_kernel():
             results[i, 1] = best_fc
             results[i, 2] = best_bc
             results[i, 3] = best_inv
+            results[i, 4] = 0  # not flat
 
         return results
 
@@ -924,7 +1039,7 @@ def _build_numba_hq_kernel():
 _numba_hq_kernel = None
 
 
-def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_quality=False):
+def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_quality=False, bg_palette=None):
     """Assign each tile to best medoid/font-set and FG/BG indices.
 
     Default: Hamming-distance matching with luminance-based FG/BG split.
@@ -937,11 +1052,16 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
 
     Args:
         frame_tiles: list of tile dicts with 'pixels' key (8x8x3 uint8)
-        palette: (256, 3) uint8 RGB palette
+        palette: (256, 3) uint8 RGB palette (used as FG palette)
         clustered_medoids: (n_medoids, 8) uint8 font patterns
         high_quality: if True, use reconstruction-error search (slower, better)
+        bg_palette: (256, 3) uint8 RGB palette for background.
+                    If None, uses palette for both FG and BG (shared mode).
     """
     global _numba_hq_kernel
+
+    if bg_palette is None:
+        bg_palette = palette
 
     n_medoids = clustered_medoids.shape[0]
     n_tiles = len(frame_tiles)
@@ -958,7 +1078,8 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
             for c in range(8):
                 medoid_bits[m_idx, r * 8 + c] = (byte >> (7 - c)) & 1
 
-    palette_f = palette.astype(np.float32)
+    fg_palette_f = palette.astype(np.float32)
+    bg_palette_f = bg_palette.astype(np.float32)
     medoid_bits_f = medoid_bits.astype(np.float32)  # (n_medoids, 64)
 
     K = 3  # top-K palette candidates when high_quality is on
@@ -975,17 +1096,18 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
             print("  [numba] JIT-compiling high-quality kernel (first call only)...")
             _numba_hq_kernel = _build_numba_hq_kernel()
 
-        hq_results = _numba_hq_kernel(all_pixels, palette_f, medoid_bits_f, K)
-        # hq_results: (n_tiles, 4) int32 — [best_medoid, fg_idx, bg_idx, invert]
+        hq_results = _numba_hq_kernel(all_pixels, fg_palette_f, bg_palette_f, medoid_bits_f, K)
+        # hq_results: (n_tiles, 5) int32 — [best_medoid, fg_idx, bg_idx, invert, is_flat]
 
         for i in range(n_tiles):
             best_medoid = int(hq_results[i, 0])
             fg_idx      = int(hq_results[i, 1])
             bg_idx      = int(hq_results[i, 2])
             best_invert = int(hq_results[i, 3])
+            is_flat     = int(hq_results[i, 4])
 
-            # Flat tile: medoid==0, fg==bg → font-set 0, char 0
-            if fg_idx == bg_idx:
+            # Flat tile: all pixels identical → font-set 0, char 0
+            if is_flat:
                 tile_assignments[i] = [0, 0, fg_idx, bg_idx, 0]
             else:
                 fs = best_medoid // 256
@@ -1003,7 +1125,7 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
         unique_colors = np.unique(orig_rgb, axis=0)
         if len(unique_colors) < 2:
             avg = orig_rgb.mean(axis=0)
-            dists = np.linalg.norm(palette_f - avg, axis=1)
+            dists = np.linalg.norm(bg_palette_f - avg, axis=1)
             dists[0] = float('inf')
             best_color = int(np.argmin(dists))
             tile_assignments[i] = [0, 0, best_color, best_color, 0]
@@ -1023,11 +1145,11 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
             # Uses an algebraic expansion of per-pixel SSE so that the inner
             # loop is a single (n_medoids, 64) @ (64,) matrix-vector product
             # per (fg, bg, inversion) candidate — very fast.
-            fg_dists_all = np.linalg.norm(palette_f - fg_center, axis=1)
+            fg_dists_all = np.linalg.norm(fg_palette_f - fg_center, axis=1)
             fg_dists_all[0] = float('inf')
             fg_candidates = np.argpartition(fg_dists_all, K)[:K]
 
-            bg_dists_all = np.linalg.norm(palette_f - bg_center, axis=1)
+            bg_dists_all = np.linalg.norm(bg_palette_f - bg_center, axis=1)
             bg_dists_all[0] = float('inf')
             bg_candidates = np.argpartition(bg_dists_all, K)[:K]
 
@@ -1035,11 +1157,12 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
             best_result = (0, int(fg_candidates[0]), int(bg_candidates[0]), 0)
 
             for fc in fg_candidates:
-                fg_color = palette_f[fc]  # (3,)
+                fg_color = fg_palette_f[fc]  # (3,)
                 for bc in bg_candidates:
-                    if fc == bc:
+                    bg_color = bg_palette_f[bc]  # (3,)
+                    # Skip if colors are identical (flat)
+                    if np.allclose(fg_color, bg_color):
                         continue
-                    bg_color = palette_f[bc]  # (3,)
                     diff = fg_color - bg_color  # (3,)
                     diff_sq = float(np.dot(diff, diff))
 
@@ -1072,14 +1195,16 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
 
         else:
             # --- Legacy Hamming-distance matching ---
-            fg_dists = np.linalg.norm(palette_f - fg_center, axis=1)
+            fg_dists = np.linalg.norm(fg_palette_f - fg_center, axis=1)
             fg_dists[0] = float('inf')
             fg_idx = int(np.argmin(fg_dists))
 
-            bg_dists = np.linalg.norm(palette_f - bg_center, axis=1)
+            bg_dists = np.linalg.norm(bg_palette_f - bg_center, axis=1)
             bg_idx = int(np.argmin(bg_dists))
 
-            if fg_idx == bg_idx:
+            # When palettes are separate, indices refer to different LUTs
+            # so numerical equality is not meaningful; compare actual colors.
+            if np.allclose(fg_palette_f[fg_idx], bg_palette_f[bg_idx]):
                 bg_dists[bg_idx] = float('inf')
                 bg_idx = int(np.argmin(bg_dists))
 
@@ -1125,11 +1250,11 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
     return tile_assignments
 
 
-def process_animation_frames_memtext_global(input_dir, high_quality=False):
+def process_animation_frames_memtext_global(input_dir, high_quality=False, split_palette=False):
     """Process animation frames in MEMTEXT mode.
     
     Key differences from regular animation mode:
-    - 256-color FG/BG palettes (identical)
+    - 256-color FG/BG palettes (identical, or split with --split-palette)
     - 1024 medoids in 4 font sets of 256 each
     - Pattern inversion support to reduce unique patterns
     - Tile data includes font_set (0-3), char_index (0-255), and invert bit
@@ -1137,6 +1262,7 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False):
     Args:
         input_dir: Directory containing input frames
         high_quality: if True, use reconstruction-error tile matching
+        split_palette: if True, derive separate FG/BG palettes (512 total colors)
     """
     # Find all image files
     image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp', '*.tiff']
@@ -1152,8 +1278,13 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False):
     
     print(f"Found {len(image_files)} image files")
     
-    # Step 1: Create 256-color global palette
-    palette = create_memtext_256_color_palette(image_files)
+    # Step 1: Create palette(s)
+    if split_palette:
+        fg_palette, bg_palette = create_memtext_512_color_palette(image_files)
+        palette = fg_palette  # used as reference for medoid derivation
+    else:
+        palette = create_memtext_256_color_palette(image_files)
+        fg_palette = bg_palette = palette
     
     # Step 2: Load all frames and extract tiles
     print("Extracting 8x8 patterns from all frames...")
@@ -1189,7 +1320,8 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False):
         print(f"Processing frame {frame_idx+1}/{len(frame_tile_indices)}...")
         frame_tiles = all_tiles[start:end]
         tile_assignments = assign_tiles_to_medoids(
-            frame_tiles, palette, clustered_medoids, high_quality=high_quality)
+            frame_tiles, fg_palette, clustered_medoids, high_quality=high_quality,
+            bg_palette=bg_palette)
         
         frames_data.append({
             'width': 640,
@@ -1197,18 +1329,20 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False):
             'use_single_row_blocks': False,
             'memtext': True,
             'tile_assignments': tile_assignments,  # (n_tiles, 5): fs, char, fg, bg, invert
-            'palette': palette,
+            'palette': fg_palette,
+            'bg_palette': bg_palette,
             'font_sets': font_sets,
         })
     
     # Store shared data in first frame for output
-    frames_data[0]['global_palette'] = palette
+    frames_data[0]['global_palette'] = fg_palette
+    frames_data[0]['global_bg_palette'] = bg_palette
     frames_data[0]['global_font_sets'] = font_sets
     
     return frames_data
 
 
-def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quality=False):
+def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quality=False, split_palette=False):
     """Process animation frames in MEMTEXT hybrid mode.
 
     Hybrid mode characteristics (workaround for FPGA LUT 1 bug):
@@ -1231,8 +1365,13 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
 
     print(f"Found {len(image_files)} image files")
 
-    # Step 1: Create single global 256-color palette from all frames
-    palette = create_memtext_256_color_palette(image_files)
+    # Step 1: Create global palette(s)
+    if split_palette:
+        fg_palette, bg_palette = create_memtext_512_color_palette(image_files)
+        palette = fg_palette
+    else:
+        palette = create_memtext_256_color_palette(image_files)
+        fg_palette = bg_palette = palette
 
     frames_data = []
 
@@ -1262,7 +1401,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
             font_sets_local = [combined_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
-                frame_tiles, palette, combined_medoids, high_quality=high_quality)
+                frame_tiles, fg_palette, combined_medoids, high_quality=high_quality,
+                bg_palette=bg_palette)
 
             frames_data.append({
                 'width': 640,
@@ -1270,7 +1410,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
                 'use_single_row_blocks': False,
                 'memtext': True,
                 'tile_assignments': tile_assignments,
-                'palette': palette,
+                'palette': fg_palette,
+                'bg_palette': bg_palette,
                 'font_sets': font_sets_local,
                 'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
                 'lut_id': 0,
@@ -1286,7 +1427,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
             font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
-                frame_tiles, palette, clustered_medoids, high_quality=high_quality)
+                frame_tiles, fg_palette, clustered_medoids, high_quality=high_quality,
+                bg_palette=bg_palette)
 
             frames_data.append({
                 'width': 640,
@@ -1294,19 +1436,21 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
                 'use_single_row_blocks': False,
                 'memtext': True,
                 'tile_assignments': tile_assignments,
-                'palette': palette,
+                'palette': fg_palette,
+                'bg_palette': bg_palette,
                 'font_sets': font_sets_local,
                 'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
                 'lut_id': 0,
             })
 
     # Store global palette in first frame for output
-    frames_data[0]['global_palette'] = palette
+    frames_data[0]['global_palette'] = fg_palette
+    frames_data[0]['global_bg_palette'] = bg_palette
 
     return frames_data
 
 
-def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_quality=False):
+def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_quality=False, split_palette=False):
     """Process animation frames in MEMTEXT frame mode.
 
     Frame mode characteristics:
@@ -1363,13 +1507,18 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
             frame_canonical = all_frame_canonical_sets[frame_idx]
 
             palette = create_memtext_256_color_palette_from_image(image)
+            if split_palette:
+                fg_pal, bg_pal = create_memtext_512_color_palette_from_image(image)
+            else:
+                fg_pal = bg_pal = palette
 
             combined_medoids = derive_medoids_with_coherence(
                 frame_canonical, 512, coherence_medoids)
             font_sets_local = [combined_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
-                frame_tiles, palette, combined_medoids, high_quality=high_quality)
+                frame_tiles, fg_pal, combined_medoids, high_quality=high_quality,
+                bg_palette=bg_pal)
 
             frames_data.append({
                 'width': 640,
@@ -1377,7 +1526,8 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
                 'use_single_row_blocks': False,
                 'memtext': True,
                 'tile_assignments': tile_assignments,
-                'palette': palette,
+                'palette': fg_pal,
+                'bg_palette': bg_pal,
                 'font_sets': font_sets_local,
                 'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
                 'lut_id': frame_idx % 2,
@@ -1388,7 +1538,12 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
             print(f"Processing frame {frame_idx + 1}/{len(image_files)}: {os.path.basename(image_file)}")
             image = load_and_scale_image(image_file)
 
-            palette = create_memtext_256_color_palette_from_image(image)
+            if split_palette:
+                fg_pal, bg_pal = create_memtext_512_color_palette_from_image(image)
+                palette = fg_pal
+            else:
+                palette = create_memtext_256_color_palette_from_image(image)
+                fg_pal = bg_pal = palette
             frame_tiles = extract_frame_tiles(image)
 
             clustered_medoids = derive_medoids_from_tiles(
@@ -1396,7 +1551,8 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
             font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
-                frame_tiles, palette, clustered_medoids, high_quality=high_quality)
+                frame_tiles, fg_pal, clustered_medoids, high_quality=high_quality,
+                bg_palette=bg_pal)
 
             frames_data.append({
                 'width': 640,
@@ -1404,7 +1560,8 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
                 'use_single_row_blocks': False,
                 'memtext': True,
                 'tile_assignments': tile_assignments,
-                'palette': palette,
+                'palette': fg_pal,
+                'bg_palette': bg_pal,
                 'font_sets': font_sets_local,
                 'font_id_base': 0 if (frame_idx % 2 == 0) else 2,
                 'lut_id': frame_idx % 2,
@@ -1491,6 +1648,7 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
     
     if encoding_mode in ('global', 'hybrid'):
         palette = frames_data[0]['global_palette']
+        bg_palette_global = frames_data[0].get('global_bg_palette', palette)
         if encoding_mode == 'global':
             font_sets = frames_data[0]['global_font_sets']
     
@@ -1509,14 +1667,21 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
         f.write(struct.pack('BBBBBBBB', magic, version, frame_duration_byte, mode, columns, rows, xoffset, yoffset))
         
         if encoding_mode in ('global', 'hybrid'):
-            palette_bgra = np.zeros((256, 4), dtype=np.uint8)
-            palette_bgra[:, 0] = palette[:, 2]
-            palette_bgra[:, 1] = palette[:, 1]
-            palette_bgra[:, 2] = palette[:, 0]
-            palette_bgra[:, 3] = 255
-            palette_bgra[0, 3] = 0
+            fg_bgra = np.zeros((256, 4), dtype=np.uint8)
+            fg_bgra[:, 0] = palette[:, 2]
+            fg_bgra[:, 1] = palette[:, 1]
+            fg_bgra[:, 2] = palette[:, 0]
+            fg_bgra[:, 3] = 255
+            fg_bgra[0, 3] = 0
 
-            lut_data = palette_bgra.tobytes() + palette_bgra.tobytes()
+            bg_bgra = np.zeros((256, 4), dtype=np.uint8)
+            bg_bgra[:, 0] = bg_palette_global[:, 2]
+            bg_bgra[:, 1] = bg_palette_global[:, 1]
+            bg_bgra[:, 2] = bg_palette_global[:, 0]
+            bg_bgra[:, 3] = 255
+            bg_bgra[0, 3] = 0
+
+            lut_data = fg_bgra.tobytes() + bg_bgra.tobytes()
             f.write(struct.pack('BBH', 0x01, 0x00, len(lut_data)))
             f.write(lut_data)
 
@@ -1536,19 +1701,27 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
             f.write(struct.pack('BBH', 0x00, 0x00, 0))
 
             if encoding_mode == 'frame':
-                frame_palette = frame_data['palette']
+                frame_fg_pal = frame_data['palette']
+                frame_bg_pal = frame_data.get('bg_palette', frame_fg_pal)
                 frame_font_sets = frame_data['font_sets']
                 lut_id = frame_data.get('lut_id', frame_idx % 2)
                 font_id_base = frame_data.get('font_id_base', 0 if (frame_idx % 2 == 0) else 2)
 
-                palette_bgra = np.zeros((256, 4), dtype=np.uint8)
-                palette_bgra[:, 0] = frame_palette[:, 2]
-                palette_bgra[:, 1] = frame_palette[:, 1]
-                palette_bgra[:, 2] = frame_palette[:, 0]
-                palette_bgra[:, 3] = 255
-                palette_bgra[0, 3] = 0
+                fg_bgra = np.zeros((256, 4), dtype=np.uint8)
+                fg_bgra[:, 0] = frame_fg_pal[:, 2]
+                fg_bgra[:, 1] = frame_fg_pal[:, 1]
+                fg_bgra[:, 2] = frame_fg_pal[:, 0]
+                fg_bgra[:, 3] = 255
+                fg_bgra[0, 3] = 0
 
-                lut_data = palette_bgra.tobytes() + palette_bgra.tobytes()
+                bg_bgra = np.zeros((256, 4), dtype=np.uint8)
+                bg_bgra[:, 0] = frame_bg_pal[:, 2]
+                bg_bgra[:, 1] = frame_bg_pal[:, 1]
+                bg_bgra[:, 2] = frame_bg_pal[:, 0]
+                bg_bgra[:, 3] = 255
+                bg_bgra[0, 3] = 0
+
+                lut_data = fg_bgra.tobytes() + bg_bgra.tobytes()
                 f.write(struct.pack('BBH', 0x01, lut_id & 0x01, len(lut_data)))
                 f.write(lut_data)
 
