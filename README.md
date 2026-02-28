@@ -11,6 +11,10 @@ Setup a python environment and load the dependencies
 For GPU acceleration of clustering you can install a rapids environment to get cuml.
 See install instructions at the [RAPIDS website](https://docs.rapids.ai/install/)
 
+Optionally install numba to accelerate the high-quality option.
+
+```python -m pip install numba```
+
 ## Creating an image sequence
 
 Images should be named similarly with sequence numbers so conversion can do proper ordering.  The tool will consume all images in the directory provided as an argument and order them lexicographically.  So, one directory per video.

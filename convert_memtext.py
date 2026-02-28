@@ -17,6 +17,14 @@ except Exception:
     cuKMeans = None
     _USE_CUML = False
 
+# Optional: use Numba for JIT-compiled high-quality tile matching.
+try:
+    import numba
+    _USE_NUMBA = True
+except Exception:
+    numba = None
+    _USE_NUMBA = False
+
 def make_kmeans(n_clusters, **kwargs):
     """Return a KMeans instance. Uses cuML if available, otherwise sklearn's KMeans.
 
@@ -721,6 +729,201 @@ def derive_medoids_with_coherence(frame_canonical_dict, n_medoids, coherence_med
     return combined
 
 
+# ---------------------------------------------------------------------------
+# Numba-accelerated high-quality tile matching kernel
+# ---------------------------------------------------------------------------
+def _build_numba_hq_kernel():
+    """Build and return the Numba-JIT compiled _hq_assign_tiles function.
+
+    Separated into a builder so the @njit decorator is only evaluated when
+    Numba is actually available.
+    """
+    @numba.njit(cache=True, parallel=True)
+    def _hq_assign_tiles(all_pixels, palette_f, medoid_bits_f, K):
+        """High-quality tile assignment — Numba-compiled, parallel over tiles.
+
+        Parameters
+        ----------
+        all_pixels    : (n_tiles, 64, 3) float32  – flattened tile pixels
+        palette_f     : (n_palette, 3) float32
+        medoid_bits_f : (n_medoids, 64) float32
+        K             : int – top-K palette candidates
+
+        Returns
+        -------
+        results : (n_tiles, 4) int32 – [best_medoid, fg_idx, bg_idx, invert]
+                  A tile is marked "flat" when fg_idx == bg_idx.
+        """
+        n_tiles = all_pixels.shape[0]
+        n_palette = palette_f.shape[0]
+        n_medoids = medoid_bits_f.shape[0]
+        results = np.empty((n_tiles, 4), dtype=np.int32)
+
+        for i in numba.prange(n_tiles):
+            orig = all_pixels[i]  # (64, 3)
+
+            # --- Luminance --------------------------------------------------
+            lum = np.empty(64, dtype=np.float32)
+            for p in range(64):
+                lum[p] = (0.299 * orig[p, 0]
+                          + 0.587 * orig[p, 1]
+                          + 0.114 * orig[p, 2])
+
+            # Median via sort (Numba supports np.sort on 1-D)
+            lum_sorted = np.sort(lum)
+            threshold = 0.5 * (lum_sorted[31] + lum_sorted[32])
+
+            # FG / BG centres
+            fg_sum_r = np.float32(0.0); fg_sum_g = np.float32(0.0); fg_sum_b = np.float32(0.0)
+            bg_sum_r = np.float32(0.0); bg_sum_g = np.float32(0.0); bg_sum_b = np.float32(0.0)
+            fg_count = 0; bg_count = 0
+            fg_mask = np.empty(64, dtype=numba.boolean)
+            for p in range(64):
+                if lum[p] >= threshold:
+                    fg_mask[p] = True
+                    fg_count += 1
+                    fg_sum_r += orig[p, 0]; fg_sum_g += orig[p, 1]; fg_sum_b += orig[p, 2]
+                else:
+                    fg_mask[p] = False
+                    bg_count += 1
+                    bg_sum_r += orig[p, 0]; bg_sum_g += orig[p, 1]; bg_sum_b += orig[p, 2]
+
+            # Check for flat (single-colour) tile
+            is_flat = True
+            ref_r = orig[0, 0]; ref_g = orig[0, 1]; ref_b = orig[0, 2]
+            for p in range(1, 64):
+                if (orig[p, 0] != ref_r or orig[p, 1] != ref_g
+                        or orig[p, 2] != ref_b):
+                    is_flat = False
+                    break
+            if is_flat:
+                avg_r = orig[0, 0]; avg_g = orig[0, 1]; avg_b = orig[0, 2]
+                best_c = 1  # skip palette index 0
+                best_d = np.float32(1e30)
+                for ci in range(1, n_palette):
+                    dr = palette_f[ci, 0] - avg_r
+                    dg = palette_f[ci, 1] - avg_g
+                    db = palette_f[ci, 2] - avg_b
+                    d = dr * dr + dg * dg + db * db
+                    if d < best_d:
+                        best_d = d; best_c = ci
+                results[i, 0] = 0
+                results[i, 1] = best_c
+                results[i, 2] = best_c
+                results[i, 3] = 0
+                continue
+
+            fc_n = max(fg_count, 1)
+            bc_n = max(bg_count, 1)
+            fg_cr = fg_sum_r / fc_n; fg_cg = fg_sum_g / fc_n; fg_cb = fg_sum_b / fc_n
+            bg_cr = bg_sum_r / bc_n; bg_cg = bg_sum_g / bc_n; bg_cb = bg_sum_b / bc_n
+
+            # --- Top-K palette candidates (linear scan) --------------------
+            # Maintain a small sorted list of K nearest palette indices.
+            fg_top_idx = np.empty(K, dtype=np.int32)
+            fg_top_d   = np.empty(K, dtype=np.float32)
+            bg_top_idx = np.empty(K, dtype=np.int32)
+            bg_top_d   = np.empty(K, dtype=np.float32)
+            for k in range(K):
+                fg_top_idx[k] = -1; fg_top_d[k] = np.float32(1e30)
+                bg_top_idx[k] = -1; bg_top_d[k] = np.float32(1e30)
+
+            for ci in range(1, n_palette):  # skip index 0
+                dr = palette_f[ci, 0] - fg_cr
+                dg = palette_f[ci, 1] - fg_cg
+                db = palette_f[ci, 2] - fg_cb
+                d = dr * dr + dg * dg + db * db
+                # Insertion sort into top-K (K is tiny)
+                if d < fg_top_d[K - 1]:
+                    fg_top_d[K - 1] = d
+                    fg_top_idx[K - 1] = ci
+                    for s in range(K - 1, 0, -1):
+                        if fg_top_d[s] < fg_top_d[s - 1]:
+                            fg_top_d[s], fg_top_d[s - 1] = fg_top_d[s - 1], fg_top_d[s]
+                            fg_top_idx[s], fg_top_idx[s - 1] = fg_top_idx[s - 1], fg_top_idx[s]
+                        else:
+                            break
+
+                dr2 = palette_f[ci, 0] - bg_cr
+                dg2 = palette_f[ci, 1] - bg_cg
+                db2 = palette_f[ci, 2] - bg_cb
+                d2 = dr2 * dr2 + dg2 * dg2 + db2 * db2
+                if d2 < bg_top_d[K - 1]:
+                    bg_top_d[K - 1] = d2
+                    bg_top_idx[K - 1] = ci
+                    for s in range(K - 1, 0, -1):
+                        if bg_top_d[s] < bg_top_d[s - 1]:
+                            bg_top_d[s], bg_top_d[s - 1] = bg_top_d[s - 1], bg_top_d[s]
+                            bg_top_idx[s], bg_top_idx[s - 1] = bg_top_idx[s - 1], bg_top_idx[s]
+                        else:
+                            break
+
+            # --- SSE search over K×K colour pairs × n_medoids -------------
+            best_sse = np.float32(1e30)
+            best_m = np.int32(0)
+            best_fc = fg_top_idx[0]
+            best_bc = bg_top_idx[0]
+            best_inv = np.int32(0)
+
+            gain   = np.empty(64, dtype=np.float32)
+            gain_i = np.empty(64, dtype=np.float32)
+
+            for ki in range(K):
+                fc = fg_top_idx[ki]
+                if fc < 0:
+                    continue
+                fgr = palette_f[fc, 0]; fgg = palette_f[fc, 1]; fgb = palette_f[fc, 2]
+                for kj in range(K):
+                    bc = bg_top_idx[kj]
+                    if bc < 0 or fc == bc:
+                        continue
+                    bgr = palette_f[bc, 0]; bgg = palette_f[bc, 1]; bgb = palette_f[bc, 2]
+
+                    diff_r = fgr - bgr; diff_g = fgg - bgg; diff_b = fgb - bgb
+                    diff_sq = diff_r * diff_r + diff_g * diff_g + diff_b * diff_b
+
+                    # Normal pattern: recon_p = bg + bit_p * diff
+                    base = np.float32(0.0)
+                    base_i = np.float32(0.0)
+                    for p in range(64):
+                        er = bgr - orig[p, 0]; eg = bgg - orig[p, 1]; eb = bgb - orig[p, 2]
+                        e_dot_d = er * diff_r + eg * diff_g + eb * diff_b
+                        base += er * er + eg * eg + eb * eb
+                        gain[p] = np.float32(2.0) * e_dot_d + diff_sq
+
+                        eir = fgr - orig[p, 0]; eig = fgg - orig[p, 1]; eib = fgb - orig[p, 2]
+                        ei_dot_d = eir * diff_r + eig * diff_g + eib * diff_b
+                        base_i += eir * eir + eig * eig + eib * eib
+                        gain_i[p] = np.float32(-2.0) * ei_dot_d + diff_sq
+
+                    for m in range(n_medoids):
+                        sse_n = base
+                        sse_v = base_i
+                        for p in range(64):
+                            bit = medoid_bits_f[m, p]
+                            sse_n += bit * gain[p]
+                            sse_v += bit * gain_i[p]
+                        if sse_n < best_sse:
+                            best_sse = sse_n
+                            best_m = m; best_fc = fc; best_bc = bc; best_inv = np.int32(0)
+                        if sse_v < best_sse:
+                            best_sse = sse_v
+                            best_m = m; best_fc = fc; best_bc = bc; best_inv = np.int32(1)
+
+            results[i, 0] = best_m
+            results[i, 1] = best_fc
+            results[i, 2] = best_bc
+            results[i, 3] = best_inv
+
+        return results
+
+    return _hq_assign_tiles
+
+
+# Lazily compiled handle — filled on first use.
+_numba_hq_kernel = None
+
+
 def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_quality=False):
     """Assign each tile to best medoid/font-set and FG/BG indices.
 
@@ -729,12 +932,17 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
     selects the (FG, BG, medoid, invert) combination that minimises actual
     pixel-level reconstruction error.
 
+    If Numba is available the high-quality path is JIT-compiled and
+    parallelised across CPU cores for a significant speed-up.
+
     Args:
         frame_tiles: list of tile dicts with 'pixels' key (8x8x3 uint8)
         palette: (256, 3) uint8 RGB palette
         clustered_medoids: (n_medoids, 8) uint8 font patterns
         high_quality: if True, use reconstruction-error search (slower, better)
     """
+    global _numba_hq_kernel
+
     n_medoids = clustered_medoids.shape[0]
     n_tiles = len(frame_tiles)
     n_font_sets = max(1, n_medoids // 256)
@@ -755,6 +963,40 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
 
     K = 3  # top-K palette candidates when high_quality is on
 
+    # ----- Numba fast-path for high_quality --------------------------------
+    if high_quality and _USE_NUMBA:
+        # Pack all tile pixels into a contiguous (n_tiles, 64, 3) float32 array
+        all_pixels = np.empty((n_tiles, 64, 3), dtype=np.float32)
+        for i, tile in enumerate(frame_tiles):
+            all_pixels[i] = tile['pixels'].reshape(64, 3).astype(np.float32)
+
+        # Lazily compile the kernel on first call
+        if _numba_hq_kernel is None:
+            print("  [numba] JIT-compiling high-quality kernel (first call only)...")
+            _numba_hq_kernel = _build_numba_hq_kernel()
+
+        hq_results = _numba_hq_kernel(all_pixels, palette_f, medoid_bits_f, K)
+        # hq_results: (n_tiles, 4) int32 — [best_medoid, fg_idx, bg_idx, invert]
+
+        for i in range(n_tiles):
+            best_medoid = int(hq_results[i, 0])
+            fg_idx      = int(hq_results[i, 1])
+            bg_idx      = int(hq_results[i, 2])
+            best_invert = int(hq_results[i, 3])
+
+            # Flat tile: medoid==0, fg==bg → font-set 0, char 0
+            if fg_idx == bg_idx:
+                tile_assignments[i] = [0, 0, fg_idx, bg_idx, 0]
+            else:
+                fs = best_medoid // 256
+                if fs >= n_font_sets:
+                    fs = n_font_sets - 1
+                char_idx = best_medoid % 256
+                tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert]
+
+        return tile_assignments
+
+    # ----- Scalar (non-Numba) path -----------------------------------------
     for i, tile in enumerate(frame_tiles):
         orig_rgb = tile['pixels'].reshape(-1, 3).astype(np.float32)  # (64, 3)
 
