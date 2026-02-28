@@ -39,6 +39,10 @@ The Hybrid mode is experimental and will increase file size.  Generally the defa
 
 Note: frame encoding does not currently work on the hardware.  Do not use that encoding-mode.
 
+Quality Options:
+- ```--high-quality``` -- should generally use this you have numba installed
+-- ```--split-palette``` -- uses 512 colors split between foreground and background palettes.  Much better color fidelity with some risk of artifacting.  Usually worth the trade-off.
+
 If you want to see the reconstructed images on your host the render_memtext.py tool can take a bin file and show you what each frame will look like when output by the anim_memtext.pgz.
 
 ```python render_memtext.py animation.bin  output_dir```
