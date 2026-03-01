@@ -41,7 +41,9 @@ Note: frame encoding does not currently work on the hardware.  Do not use that e
 
 Quality Options:
 - ```--high-quality``` -- should generally use this you have numba installed
--- ```--split-palette``` -- uses 512 colors split between foreground and background palettes.  Much better color fidelity with some risk of artifacting.  Usually worth the trade-off.
+- ```--split-palette``` -- uses 512 colors split between foreground and background palettes.  Much better color fidelity with some risk of artifacting.  Usually worth the trade-off.
+
+- ```--denoise-medoids N``` -- filters medoids to reduce stray medoids.  Use N = 1 for conservative single pixel removal, N =  2 for moderate 2-pixel stray pair removal
 
 If you want to see the reconstructed images on your host the render_memtext.py tool can take a bin file and show you what each frame will look like when output by the anim_memtext.pgz.
 

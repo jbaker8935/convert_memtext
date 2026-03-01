@@ -218,6 +218,17 @@ def main():
              'Provides better color fidelity for most animations.'
 
     )
+    parser.add_argument(
+        '--denoise-medoids',
+        type=int,
+        default=0,
+        metavar='SIZE',
+        help='Remove pixel-island artifacts from medoid patterns. '
+             'Connected components (8-connectivity) of set or clear bits with '
+             'pixel count <= SIZE are flipped. 0=disabled (default), 1=single-pixel '
+             'islands only, 2=1-and-2-pixel islands, etc. '
+             'Typical values: 1 (conservative) or 2 (moderate).'
+    )
     args = parser.parse_args()
 
     print("K2 Memtext Image Converter")
@@ -227,28 +238,34 @@ def main():
     n_coherence = args.coherence_medoids
     high_quality = args.high_quality
     split_palette = args.split_palette
+    denoise = args.denoise_medoids
     if high_quality:
         print("  High quality: ON (reconstruction-error tile matching)")
     if split_palette:
         print("  Split palette: ON (256 FG + 256 BG = 512 total colors)")
+    if denoise > 0:
+        print(f"  Denoise medoids: ON (removing islands <= {denoise} pixels, 8-connectivity)")
     if args.encoding_mode == 'global':
         if n_coherence > 0:
             print("Note: --coherence-medoids is ignored in global mode (all medoids are already global)")
         print("MEMTEXT global mode: 256-color palette, 1024 medoids in 4 font sets, shared across all frames")
         frames_data = process_animation_frames_memtext_global(
-            args.animation, high_quality=high_quality, split_palette=split_palette)
+            args.animation, high_quality=high_quality, split_palette=split_palette,
+            denoise=denoise)
     elif args.encoding_mode == 'hybrid':
         print("MEMTEXT hybrid mode: global 256-color palette, per-frame 512 medoids in 2 font sets")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
         frames_data = process_animation_frames_memtext_hybrid(
-            args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette)
+            args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette,
+            denoise=denoise)
     else:
         print("MEMTEXT frame mode: per-frame 256-color palette, 512 medoids in 2 font sets, double-buffered LUT/font IDs")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
         frames_data = process_animation_frames_memtext_frame(
-            args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette)
+            args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette,
+            denoise=denoise)
 
     if not frames_data:
         print("Error: No frames processed successfully")
@@ -527,6 +544,132 @@ def extract_frame_tiles(image):
 def _medoid_feature_weights():
     """Return (edge_w, density_w, raw_w) feature-block scaling factors."""
     return 0.1, 0.1, 10.0
+
+
+# ---------------------------------------------------------------------------
+# Pixel-island denoising for medoid patterns
+# ---------------------------------------------------------------------------
+
+def _connected_components_8(mat):
+    """Label connected components of True cells in an 8×8 boolean matrix (8-connectivity).
+
+    Returns (labels, n_components) where labels is an 8×8 int array
+    with values 0 (background / False) and 1..n_components for each component.
+    """
+    labels = np.zeros((8, 8), dtype=np.int32)
+    current_label = 0
+
+    for sr in range(8):
+        for sc in range(8):
+            if mat[sr, sc] and labels[sr, sc] == 0:
+                # BFS flood-fill
+                current_label += 1
+                queue = [(sr, sc)]
+                labels[sr, sc] = current_label
+                while queue:
+                    r, c = queue.pop()
+                    for dr in (-1, 0, 1):
+                        for dc in (-1, 0, 1):
+                            if dr == 0 and dc == 0:
+                                continue
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < 8 and 0 <= nc < 8:
+                                if mat[nr, nc] and labels[nr, nc] == 0:
+                                    labels[nr, nc] = current_label
+                                    queue.append((nr, nc))
+
+    return labels, current_label
+
+
+def denoise_medoid_pattern(pattern, max_island_size):
+    """Remove pixel islands from an 8-byte medoid bit pattern.
+
+    Connected components (8-connectivity) of set bits *or* clear bits that
+    have total pixel count <= max_island_size are flipped.  This is
+    equivalent to a binary area-opening followed by an area-closing.
+
+    The all-zeros and all-ones patterns are never modified.
+
+    Args:
+        pattern: np.array of shape (8,), dtype=uint8 — 8 bytes encoding 8×8 bits.
+        max_island_size: maximum component size to remove (e.g. 1 or 2).
+
+    Returns:
+        np.array of shape (8,), dtype=uint8 — cleaned pattern.
+    """
+    if max_island_size <= 0:
+        return pattern
+
+    # Quick check: skip all-0 and all-0xFF patterns
+    total_bits = sum(bin(int(b)).count('1') for b in pattern)
+    if total_bits == 0 or total_bits == 64:
+        return pattern
+
+    # Unpack to 8×8 boolean matrix
+    mat = np.zeros((8, 8), dtype=bool)
+    for row in range(8):
+        byte = int(pattern[row])
+        for col in range(8):
+            mat[row, col] = bool((byte >> (7 - col)) & 1)
+
+    changed = False
+
+    # Pass 1: remove small islands of set bits (foreground islands)
+    labels_fg, n_fg = _connected_components_8(mat)
+    for lbl in range(1, n_fg + 1):
+        size = int(np.sum(labels_fg == lbl))
+        if size <= max_island_size:
+            mat[labels_fg == lbl] = False
+            changed = True
+
+    # Pass 2: remove small islands of clear bits (background islands / holes)
+    labels_bg, n_bg = _connected_components_8(~mat)
+    for lbl in range(1, n_bg + 1):
+        size = int(np.sum(labels_bg == lbl))
+        if size <= max_island_size:
+            mat[labels_bg == lbl] = True
+            changed = True
+
+    if not changed:
+        return pattern
+
+    # Repack to 8 bytes
+    result = np.zeros(8, dtype=np.uint8)
+    for row in range(8):
+        byte = 0
+        for col in range(8):
+            if mat[row, col]:
+                byte |= (1 << (7 - col))
+        result[row] = byte
+
+    return result
+
+
+def denoise_medoid_set(medoids, max_island_size):
+    """Apply pixel-island denoising to an entire medoid array.
+
+    Args:
+        medoids: np.array of shape (n, 8), dtype=uint8.
+        max_island_size: maximum island size to remove (0 = no-op).
+
+    Returns:
+        np.array of shape (n, 8), dtype=uint8 — cleaned medoids.
+    """
+    if max_island_size <= 0:
+        return medoids
+
+    cleaned = medoids.copy()
+    n_modified = 0
+    for i in range(len(cleaned)):
+        before = cleaned[i].copy()
+        cleaned[i] = denoise_medoid_pattern(cleaned[i], max_island_size)
+        if not np.array_equal(before, cleaned[i]):
+            n_modified += 1
+
+    if n_modified > 0:
+        print(f"  Denoise: modified {n_modified}/{len(cleaned)} medoid patterns "
+              f"(removed islands <= {max_island_size}px)")
+    return cleaned
 
 
 def derive_medoids_from_tiles(frame_tiles, n_medoids, palette):
@@ -1250,7 +1393,7 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
     return tile_assignments
 
 
-def process_animation_frames_memtext_global(input_dir, high_quality=False, split_palette=False):
+def process_animation_frames_memtext_global(input_dir, high_quality=False, split_palette=False, denoise=0):
     """Process animation frames in MEMTEXT mode.
     
     Key differences from regular animation mode:
@@ -1263,6 +1406,7 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
         input_dir: Directory containing input frames
         high_quality: if True, use reconstruction-error tile matching
         split_palette: if True, derive separate FG/BG palettes (512 total colors)
+        denoise: max island size to remove from medoids (0=disabled)
     """
     # Find all image files
     image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp', '*.tiff']
@@ -1305,6 +1449,8 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
     # Step 3: Cluster to 1024 medoids
     print("Clustering to 1024 medoids...")
     clustered_medoids = derive_medoids_from_tiles(all_tiles, 1024, palette)
+    if denoise > 0:
+        clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
     print(f"Created {len(clustered_medoids)} medoids")
     
     # Split into 4 font sets of 256 each
@@ -1342,7 +1488,7 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
     return frames_data
 
 
-def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quality=False, split_palette=False):
+def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quality=False, split_palette=False, denoise=0):
     """Process animation frames in MEMTEXT hybrid mode.
 
     Hybrid mode characteristics (workaround for FPGA LUT 1 bug):
@@ -1398,6 +1544,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
 
             combined_medoids = derive_medoids_with_coherence(
                 frame_canonical, 512, coherence_medoids)
+            if denoise > 0:
+                combined_medoids = denoise_medoid_set(combined_medoids, denoise)
             font_sets_local = [combined_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
@@ -1424,6 +1572,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
             frame_tiles = extract_frame_tiles(image)
 
             clustered_medoids = derive_medoids_from_tiles(frame_tiles, 512, palette)
+            if denoise > 0:
+                clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
             font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
@@ -1450,7 +1600,7 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
     return frames_data
 
 
-def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_quality=False, split_palette=False):
+def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_quality=False, split_palette=False, denoise=0):
     """Process animation frames in MEMTEXT frame mode.
 
     Frame mode characteristics:
@@ -1514,6 +1664,8 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
 
             combined_medoids = derive_medoids_with_coherence(
                 frame_canonical, 512, coherence_medoids)
+            if denoise > 0:
+                combined_medoids = denoise_medoid_set(combined_medoids, denoise)
             font_sets_local = [combined_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
@@ -1548,6 +1700,8 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
 
             clustered_medoids = derive_medoids_from_tiles(
                 frame_tiles, 512, palette)
+            if denoise > 0:
+                clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
             font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
