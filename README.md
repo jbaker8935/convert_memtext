@@ -45,6 +45,8 @@ Quality Options:
 
 - ```--denoise-medoids N``` -- filters medoids to reduce stray medoids.  Use N = 1 for conservative single pixel removal, N =  2 for moderate 2-pixel stray pair removal
 
+- ```--crop-to-fill``` -- uses center cropping to fill image canvas instead of using letterboxing.
+
 If you want to see the reconstructed images on your host the render_memtext.py tool can take a bin file and show you what each frame will look like when output by the anim_memtext.pgz.
 
 ```python render_memtext.py animation.bin  output_dir```

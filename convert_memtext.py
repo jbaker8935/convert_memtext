@@ -9,6 +9,9 @@ import argparse
 import sys
 from sklearn.cluster import KMeans
 
+# Global configuration flags set by command-line arguments
+CROP_TO_FILL = False  # when True, images are scaled and then center-cropped to exactly 640×480
+
 # Optional: prefer cuML KMeans if available (GPU acceleration). Fallback to sklearn KMeans.
 try:
     from cuml.cluster import KMeans as cuKMeans
@@ -229,7 +232,20 @@ def main():
              'islands only, 2=1-and-2-pixel islands, etc. '
              'Typical values: 1 (conservative) or 2 (moderate).'
     )
+    parser.add_argument(
+        '--crop-to-fill',
+        action='store_true',
+        help='Scale and then centre-crop input images so the 640×480 canvas is ' \
+             'completely covered. Uses equal cropping on both sides of the ' \
+             'overflowing dimension. By default images are padded with black.'
+    )
     args = parser.parse_args()
+
+    # honour new cropping flag
+    global CROP_TO_FILL
+    if args.crop_to_fill:
+        CROP_TO_FILL = True
+        print("  Crop-to-fill: ON (canvas will be filled by cropping overflow)")
 
     print("K2 Memtext Image Converter")
     print("============================")
@@ -283,30 +299,57 @@ def main():
 
 
 def load_and_scale_image(input_path):
-    """Load and scale image to 640x480 with aspect ratio preservation."""
+    """Load and scale image to 640x480 with aspect ratio preservation.
+
+    By default the scaled picture is padded with black to fit the 640×480
+    canvas.  If :pydata:`CROP_TO_FILL` is True (set by ``--crop-to-fill``
+    command‑line option) the image is instead scaled so the canvas is fully
+    covered and the overflow dimension is cropped equally on both sides.
+    """
+    global CROP_TO_FILL
     img = Image.open(input_path).convert('RGB')
     target_size = (640, 480)
-    
-    # Calculate new size preserving aspect ratio
+
+    # Calculate ratios for decision making
     img_ratio = img.width / img.height
     target_ratio = target_size[0] / target_size[1]
-    
-    if img_ratio > target_ratio:
-        new_width = target_size[0]
-        new_height = int(target_size[0] / img_ratio)
+
+    if CROP_TO_FILL:
+        # Scale so that the image completely fills the target area, then crop
+        if img_ratio > target_ratio:
+            # source is wider than target, scale height then crop width
+            new_height = target_size[1]
+            new_width = int(img_ratio * new_height)
+        else:
+            # source is taller (or equal), scale width then crop height
+            new_width = target_size[0]
+            new_height = int(new_width / img_ratio)
+
+        img_resized = img.resize((new_width, new_height), Image.LANCZOS)
+        # center-crop to target size
+        left = (new_width - target_size[0]) // 2
+        top = (new_height - target_size[1]) // 2
+        right = left + target_size[0]
+        bottom = top + target_size[1]
+        return img_resized.crop((left, top, right, bottom))
     else:
-        new_height = target_size[1]
-        new_width = int(target_size[1] * img_ratio)
-    
-    img_resized = img.resize((new_width, new_height), Image.LANCZOS)
-    
-    # Create black background and center the image
-    background = Image.new('RGB', target_size, (0, 0, 0))
-    offset_x = (target_size[0] - new_width) // 2
-    offset_y = (target_size[1] - new_height) // 2
-    background.paste(img_resized, (offset_x, offset_y))
-    
-    return background
+        # original behaviour: scale to fit within target and pad with black
+        if img_ratio > target_ratio:
+            new_width = target_size[0]
+            new_height = int(target_size[0] / img_ratio)
+        else:
+            new_height = target_size[1]
+            new_width = int(target_size[1] * img_ratio)
+
+        img_resized = img.resize((new_width, new_height), Image.LANCZOS)
+
+        # Create black background and center the image
+        background = Image.new('RGB', target_size, (0, 0, 0))
+        offset_x = (target_size[0] - new_width) // 2
+        offset_y = (target_size[1] - new_height) // 2
+        background.paste(img_resized, (offset_x, offset_y))
+
+        return background
 
 def rgb_to_lab(rgb):
     """Convert RGB to LAB color space for perceptual distance calculation."""
