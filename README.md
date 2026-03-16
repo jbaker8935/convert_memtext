@@ -47,6 +47,9 @@ Quality Options:
 
 - ```--crop-to-fill``` -- uses center cropping to fill image canvas instead of using letterboxing.
 
+
+- ```--default-medoids``` -- encoding skips animation specific clustering and uses a built-in medoid set.  Lower quality, but much faster.
+
 If you want to see the reconstructed images on your host the render_memtext.py tool can take a bin file and show you what each frame will look like when output by the anim_memtext.pgz.
 
 ```python render_memtext.py animation.bin  output_dir```

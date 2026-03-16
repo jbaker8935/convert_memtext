@@ -191,6 +191,179 @@ def compute_medoids(fonts, labels, n_clusters):
 
     return medoids
 
+# Embedded default medoids (from medoids.npy).  This is the canonical 1024×8 medoid set
+# used when the --default-medoids flag is supplied.
+#
+# NOTE: This is generated from the current medoids.npy in the repo and is intentionally
+# self-contained so convert_memtext.py can run without any external files.
+EMBEDDED_DEFAULT_MEDOIDS_B64 = ("""
+AAAAAAAAAAA8fHh4eHh4eAMHBw9/fw8PAICAgIf///8fDwAAgP///wCAh4cPHz//AA///38HAwADQ8PD
+x8fHhz9/fvjw4IAAfwcHDx8fHz8/f/8PBwMDAAAAYPP/Dx9/A8PDx8eHBwd8eHj4+PDw4ABwcPj4+Pz+
+f38/HwSAwOAHDz8/Dw8HB/j4+IDg8Pz8Hh48PHh48PAPDx8/f/DAAD8/P3744AAAHx8PBwcHX/9/f3/+
+eAAAADwAAODw/P7/////H3zAAAD////+8AAAAADA8Hh+fz8PAAAA/39/Pw98PDw4eHh4eADg4Pj4kICA
+D/8PDwcHBwc8PDh4+PDw8PDwAADw////APD+/38AAH4AAP7/AID//38/AACA8Pz/AICEiQcX//8AxNg4
+fPz+/ADgAgH/fz//ODj48PDw+Ph/PweB8fjwAAAAfwcDD///Pz8/f35wAAAAAAF/////AD8/eMAADPz8
+8eHPjhwYOHB/f39+AAAA8AAHH////wAAAAAAB/////8AAf8PBwcf//78+Pjw0ICAAwODg8PH5/cAAAAA
+Bv///wADf////wAAAAABZ08ff/8/f///gwAAAB8fPz9/f39//vCAAAEf//8BB39/fx8HA////z8HAAAA
+fnw8vNAYMR4AAOD4AP///////8AAAAD/fz8fDwfDwQAfD4+Hx+Ph8X8/Px8PBwEAAIDwPj8/fzgBB/9/
+HwcHAwDAgzc7v5+fAADA+P78//8AAID8/wP//w888MMffOCAAP8HAP//HwAf/x8f/wAAAD8fHw8PBwcD
+P3//+ACAwPB/Hx9/fwEA/ADwAP//APj/AAD//48AB/8BAwcPDx//Hz8/f/8PAQAAAAAABx////8A///8
+APjwgD8fHw8Hg4PBAPj8/Pz48AAAAPj//39wAP//AwAABx//AAA+///+4IAAAAD//////wCf////BwAA
+Pz/fHHj4wAAAAAf//x8PDwAAAP8PH3//H///DwcDAQEAAODw+Pz+/wD+Af///wAAAPD8/PjgAP8AAADw
+/P7//wCA4PB4Pn//AID4AP///wAAwIDg+Pz+/zDAAD////iAAAAAB///P38AgODw+Bz//38fz/74YAAA
+f38HAP//AAA/AAAAAP///wAHPz8/Pz8/AAD7B/8HB/8AwP//Hw8HAwB/f38PBwMHAAB4/z9/fz8BAwcP
+Dw8f/wD/Af//AAB/fz8BAADD//8/f//8+PAAAAMHBw8f/w8HAAD//wP//wAAAAEDDz///xzswADDgz9/
+fzvwAA/+8IAA//8DAAAP////+AAAAP//Hhw8/Pz48AAA4ODAAP////j8+PjwMHDgAP8HAAD//w94OBiY
+mMz8/gMPf///BwAAANifBwEHP/8Bf38PDxD/AAH/PwMH/w8ABwcHD/8PDwcAAP//Bwf/AwAf/w9//wAA
+///8wAAAwP8AAP+PAP/z7/j4+nd2YWEBAAADBx9///9/AQAA//8D/wAHf3//fwAAAPj///wAAPh/fz8f
+BwHgAAAH//8f/wAAPx8Pj4/DgAAA4P8A//8A/z8PBw///wAAfwOHwwAA+/8AgODw/Px+Pz+/n4mAwMDg
+B4eHg8PD4+M/Hw8PDw8Pf/j48PDw8PDwfwAA////AAB/PwcBAQcB/wAAAP8HH///AAf//wAAB/8AAABg
+/////z8///8A8AAA+Pj4uHBw8PD//39/PwEAAH8D//8AAAD/AAAA//+/P/8AAAMHDx///z8/Pz9/fwAA
+AAAf////AwEAAAAP////AAB////zAOAAAMF/BwcPf38A//9/HwcAABg4ePj48PDwAwePj4+Pj48PAH8B
+/wD/D////gAE/PAAAODwAID///8AAPgAAP///z8/Pz8fDwMADz////8AAADw+PDw8PD4+AD4+AD8//8A
+AADvDw8fPz8AAAAAfn///3h4ePjw8PDwHhw8eHj48PAAAwcff//jgz5+/PjwgIDAPx8//wAAA/////8f
+/gAAAAABBwcf//8PAAAA/x8f//8A+P9/HwMA4Dw4AAAA////AAAAAP////8fDwAA/w8D/398fHx4eDAA
+Dw8f/x8HAwEA/AADDx9//////x8A+AAAfHx4ePjg4IAAAPz///+gAP//Hxz8AP8AAAAA//8HD/9/Hw8H
+AwOD8////vzwwAAAAPj8/Pjw4MAAAPgA//8H/wAA+P///vAAAIDggA9///8/Px8fDwcBADicnM7nczEY
+AAAAAf8f//8AAAD+gH///wAAAP//H/8AAICAwOf/fz///PjAAAD4/z8/Pz8AAAD/AIGBh4+Pn/8/BwEB
+Awf//z9//wAAAAf/Awf//w8HAwM/P378+OAAAH8fD///AAAA/vz8+PDwwAB8eAAAAPr//wD///8AAH8A
+4ePDw8eHh4c/P38PDwcDAD+f34MDAILnf39//wEAAAB/fwAAAAD//wAAAw8ff3//AAAA/AP///8+AAAA
+8P///wAAfgcH//8PAP////8AAAA/Pz788MDAgD44ePjw8PDwAP8f/wcAAP8PHz9/fvCAAD8AAODwPH//
+AODg4ICA//8AAAAA+P///x8fH39/DwcDAAD///8AAP94AADg+Pz8/wAA////PwcBAP//H/8DAAD/////
+8AAAAAD///8G+AAAAP4AAAN///8DAwcPDw9/f3AA8Pj4+Pj4fwAA7gAA//8A+P////gAAH8/Dw//BwAA
+Px8fDw8HAwP//vz48ODAgH9/Pw8HDx9/PHj4gAD8/Pw+fvgAAAD//39/AwAA//8AAPAA/v//+AAPf39/
+fwcHAAAMf3///oAAAIDg+Px+Px9/B/8HAfgfAHh4eHh4+PjwD///AAAH/wABAf8HBw//DwcH/x8PBwcH
+fx8DAID//wd+AAAA8P///wAA8wMDf///AID4+Pj48IADAwcPH38fDz8/fHj44MCAAAAHDw8Pf/////zg
+gAAA/wAAb28fP38POHz8wAAA//8/Hx8PD/8AAD8fDw+Hg8PhAADw/P7+gID4+PAAAPD//wABAwcPH3//
+AP///wAA/wD///8PAAAceDwA//8A8P8A//8fDwcHAwH//384+NAAAD8HAAD///8AAP//AAD//wB/Hw8H
+BwMH/wAA8P74AP//AQMDBwcP//8/P///DwAAAAMDB4+Pj4+PfwPg8Pj4+AA/AAD4//8B8P/4wADgAP//
+APD4+PgA+P94eHh4eHh4+AABBx///w8DAABr/39/PwAAgP7/AAD//wABh4ePD5//AAFjx48fP38BAfPf
+BwE/fwDA/////wAA//CDH/CDPOAAB////w8AADw8eHh4eHjwOADgAPL8//8A////Dw8AAD9//vjAAAD4
+AIDg/38PB+cfHw8PDw8HBwCAwODw/P//AYOHh4+Pj498fH7+8AAA+D8//wcE+AAAf39+/PDgAAA4eHh4
+eHj4+AAAAf8PBx///////2AAAAA/Pz8/Pj4+PgD/Hz9/Hw4AAH9///8DAAB/H5//fwAAADg4+AAA8f//
+AQMDBw8fP38AAID4/39/PwCAgID9////AAAA//8P//98fHx8ePDggD8+/Pjw4MCAB4eHh4ePjwcAf/8A
+AAc//wCA//8A/v8AAP8AAP8P/x9/P/8/AQD4AP//Af8A/gMAB3//DwcHAwMAAQcff39/Hz8+fnx8fHx4
+AP8f/wMA/Ad/Pw8PB+cDAH9/Pz8/Pzw8Dw+Hx8eHBwcA/////ICAAH8AAAD/A///AP//AP8A/wAI/wAA
+B/8P/wD//wAAAX//Pn58+PDgwID//wMHD/8BAH9/fvz4gAAAAACAxD9/f/////8PBwMAAP///vBgYGAA
+AQ9+4BzwB/9/fwAAgPD8/n8AAPj///AA/v78+PDAAOAAAABA7////x8fH//+YAAAAMDAAB////9/AAAA
+AP///3h4eHh4eHh4AMDw/P7+/AD/+fDggODw8PzwAAAA////AAEDBwfP///////4AMDAAP////+AgAAA
+AAD8AP8D//8AAID+///+AAAAAQ//Hz//////AAAAwP9/Hw+HweBwOAD//wAAAf//AADgAP////98AMDg
+AP///wDAgID4/v//Pw8BAQ///wAAAP////wAAHh4ePj44GAAP3/++PDAgAB4eHh48PDw8Hh4eHw8OHh4
+AP//Af//AAB/Hx8ffwMBAD8AgPz/AMD/AAABf38fH3////9/BwAAAAAA4OCA////AAABB/9/fz8AAP9/
+AwMf//D/DwAAAz//fwD//wAHAPA/P//fjoAAAAMHf39/fwcHAPD/AACA//8A4ADw/P///38PAQABB///
+AMDzBw8fPz8A/39/PwcBAQEHD3//DwcDAHj////wAAAAAADAx////wAAAACf////P3//nwBA4BAA////
+AAAA/wDggACA////AADw8IA///////8fBwMAAADw//gAAP7/P38fDw8HAwMA/wD/AAD//wD8fwAAA///
+/OAADPEHP/8A/wf/D/9UAAAAP3///8CAeHh4eHDw8PAAwcEBB/8fH3gAALj8A///fx8PDvz4gAAAAAAH
+f3///38HAPgA//8Bfx8ff38BAAB/f3//AAAA4H8AAAD///8AAAAA/x///wB/f3/48ICAgD8P/wAA/wD/
+AAAAAw9///8BB3//DwcHB38AAAN/f39/AQMHD3//HwN/PwCAwOD8/gACBw+fn5+fAJz//gAAH/8AAH//
+//+AADw8PHh4ePDwAID4/39/DwAAAP///wD+AD8A8P4AAPz////4APj44AD///jgAAAHfwCA8Pj8nJz/
+////j4TgAAAAMPj4+Pj4+AAPf38//wAA/////4AAAAAA8PB4fH5+fgAAAPz//wD/AwMHDx8fPz8/P358
++OCAAB8PDwcHh///AAEDP39//wH///34gAAA+Dh8/ICA8PD4fwAA////gAA/Hw8PDw9/fwDg4ICA////
+f39+eAAA8PA4cOLGjQcfbwAAgPD4/v//AAAAB///H/8AAAAHf////z58/PDAwOD4AH9/f/8PAAB/fz8f
+fwAAAAB//wAB//8AfwD/APD/APgAAA9//38PA38/Hw8Hf/4cAADwf39/P38AAwcPD3//Dz8/P39/DwcD
+Pz///wMA4AA/f///AAAA//z48PDg8Pj4//8/Hx9/fw8A+Pz8/PiAAAD4//zggAL/fHx8+Hh4eGB4eHj4
++Pj4+DCw8PDw+Pj4APz//38HAAAAAP7/AP8B/z4+PDx8fHx4f39/f38AAAA/AID4//8A8D8//x8PAwEA
+AAEPf///DwD8/PCAgOD4/wABAz////8BAAAA/////oAAAAf///+PAADw///wAID+AAB/Pw8HD/8A8PDH
+h4+fnwAAgMeHH///AAAAD/////8/X28vP8DgAP///PjwwIAAP38DAQMDH/84ODj4+Pj4+H58fPjw4MCA
+OHh4eHj4+Ph/f398+OAAAD8/f378fHx4/////PDAAAA/BwGAwD4//wAAB///Dw9/fwP4APcDAP8/BwAA
+AP///wcHDw8PDw8PHx8fHwwAAP8/Pz58ePDAAH9/f38fAwAAPx8PBwcHf/8A////AAAA/wD4/wD4APz/
+AAc/f3//AAAAAABjf3///z8/Hzn4+IAAPx8PD4fDYTB4cADg8Pj8/gAA//8BBH8///AH//7wAAAA/38H
+f/8AAD8/f38ZAIDAAAADD///fwf44ODw+Pj4+ACAgIEHH///Hz8/Hw8HBwc+Pnz48PDwADw8OHh4+PDw
+AAD//wMAf/8AfwEAHP//DwAD/x8f/w8A//8AAAP//wAAAH9/f39/Az8DAP///wAAAwcH/w8PDw8AAAcH
+Dx9//z8/P3//AAAAAPj///9wAAD8/LCAAODw+ACAgIL/P39/AAAA/w//D/8AAAd/f38fB38PH/8AAAP/
+APD4AAD+//8AgOADB3///z9/f//4AAAAAAAAh09/f/8/HwcHBwcf/wCA8PCQmv7/Hx8fHz9/fwB/HwAA
+AP//DwEDB38fDw8PfgD4///4AAADA4+Pj4fHx38DAQAA/x//Px+AgMDg/P8AAAAA////////AAAAA///
+AH///wAAA38/Pz9//IAAAP////DgwIAAAAD8///+AP8AAP8AB/8f/wCA4AB4///////+/PDAAAD/////
+BwAAAP///PDggICAPz9///iAAAB/DwAA/wH/Hzh4eHDw8Pj4AQMHDw8PH38AgP8AAP///39/PweEgMDg
+PH744MAA8P8Hb28PDwcHBwDA8PD4+Pz+AAEDD38fP38A+PjwAMD//wAAA////wcB/vz4+PDgwMAAgMAA
++P///xwcPDw8eHj8B/8f//8AAAAAAAB/Dx////j4+Pj4+BD8APz//wDw/AAAgICAj5///wAA/wADD///
+P3//P3AwAAAAgOAAAP///zwDAAD///8AYHCwsPj4+Px/Pz//DwAAAD8/Hx//fwAAfwDw//8AAPg+AADw
+/wD//wEHf/9/DwMAAODgAOD+//8Afx8D//8DAD8/fx8ff38PHx8f/x//AAA/P39/YAAA4AAAAAEP////
+Px+f/38AAAAAwH5+fDw+/39/fz8H4AAAPx8fH38PAQADf///AQD4AD8/Pz8/P39/AID//38fBwD//38P
+BwcBAADgAACA////AMDwAHB/f/9/f3//+AAAAH9/cAAAwPj/f38fBwEAA/8+PPz4+PDgAP////wAAPAA
+OH//gACA8P8AAP//AwcffwAA+PjwgP//AADgcXl+f/98PHz8/PwA4AEDBw8PHz9/AACAgPz///9+fnx4
++PDgAP////AA4ADnPz8/P3zgAAB8ODg4eHh4/Hx8fDw8PDwcAIDg8AD///8AgICA+P///wABAw8PH3//
+cHB4ePj4+PgAAwcPH39/fwf/fw8PBwMBAIDA8Pz//4MAAAD////+AH8AgIDA+P//AAAAf38fH/8AAAB/
+/wc//wcHBwcHj4/PP39/+HAggMB/Pz5+fXx4IAAA/P//gYf/8PDwMDAw/v8+fPz48ODAgAAAAP//f38/
+AAB///8P+AAAAPDw8AD//wD/AP//AAD///8AAAMP/x88fGAA8Pz8/AD///8HAAAA/Pz8YADw+P4AAP//
+/4cA/3h4eHj4eHh4AQMHDw8PH38A//8AAP8A/z8/f38PAwAAAABgf39/f/8AAAN/f///AAAAAP///4D/
+fz8fD4fDgQAAAAD/f39//38fHw8PBwcDAwMHDw8ffx9/fzwAMHh4eB8+fPjw4MCA/vz8+PDw4AB/D//8
+wADwAP/8+IAAAPP/AAAA8H8///8A//8PBwcHBz9+fAAAgP7+AP8/f/8HAAA/Hw8HfPjwAAAAgICc////
+eAABBw8/f/8fHx8/Pz8/PwB/f/8/BwMBP39/Hx8/P38AAOD4PF5//38fDw8HB/MAPj58/PDgAOAAAPCA
+AP///wDgAPgA////fwAA//8DAP8/f3//fwAAAAD+//8AAID/f38/PwcBAAAAAP7/AQD//wAAgOD/////
+AP//fgAAA/8AAwcf/38PDwAAAH//////AAD/A///fwc+Pjw8PHz8/ACBg4OHD///+Pj4+PBwcHAABx9/
+//+AAAAA/4cDB3//AIDg8Pj+//8A8AAAB////wAAA/8fHz8/Px8PB4PB4fAAAHj/AA///z8/P31wYOAA
+fw8H/wEA/wM/Pz//HwMAAD8DAP//AAD/AAAAPP7////4+Ph4eHh4cACAwP///z8AAAN7Aw8f//8/B/8A
+AAD//wDDxwcHBz//AHD/H///AAAA4AD/A/8H/wAB/wAf/38PAP4AAP//Af8A4eH////AAH8/D4OAgMD/
+AAD+//8AgP8AZ0cHBw8f//jwwAD4/Pz4//8AAAAA//8AAACDn////39/Px8PBwEAfw8PDw8PZ28AAH//
+/wAD/z8/f/7YQIAAfwAAgPD4/v8/AAAA/wP//wEPz8/PBwcHAQcPf38PBwd/D///AADwAADA/39/DwcB
+Pz8PAAAA//8AcHA9H///AAAAAP+fHz///Pg4PHjw/IgAAQMPP/9/Hw8/f///wAAAAICAgAf///8AAP//
+///AAADwgAAA////APj4+Pj4gIAAQP/8/OAA/wDAIBh//z9/Hx8/fx8HAQAAAOGBBw////j48PDg4Pj+
+AAAHH/8PH38ABx8PB3//AAAA8Px+f39/Pw8AgOD4/P5/fHh4ePDwAAAAAw8/P///AAB4f/9/f39+Pj4+
+Pj4+Pgd/Px8f/x8/fwcHD///AAAfHw8PBwf/Dz8PAQABh///AMD8AT///4AAAP8A/wD/AD8////8AAAA
+Pz8PD39/fwABBx8/Pz9/fwB//38PBwMBBw8fHz/nwID8/Pj48IDg8AD4fw///wAAP3//fwAAAPgAAAD/
+//8D////jwcDAwd/fw///wD4AAAAAAf//38PAwABAwMPH///AHh/Pz8/Px8AAP8PD///AH8H/gD//wAA
+AABgf3///wB/BwAAAP///z8fDwMD/38P////AAAAAP8A/P4A/H8A/AAAAH///x//4OBgeBkd//8AAPz/
+f38PAD8fj8djEZjEAADgeH8/Pz8DP/8AAAF//wAABwcPf38/PDw8fHx4eHw+fgAAwPD//zh4+PDw8PD4
+OHh4+PDw8PB/Px748ODAgH58fHx4eHAAPwAA+P//+AAAAID4/z9//wCAgPz///8AAP7//4AAAP9/HweH
+9/MAAP///wAAAA///vz4+PDgwMB/BwDAOM89839/f3xgAADwPwAA/wAA//8/D4fDw2A4HAAAcH////kA
+AAD8/v744MB/A/8AAAD//z9+fHx4cHAA////AwH+AAD///8AAPzwAACA////AAD/AX8fBw8//w8/H/8H
+AQAE/3x4AADw+Pz/AICAx/f3x8cAv/8D/wAA/gAAAID4////AANf/x8f/AAAg4eHDx8/PwAAgICfn///
+APwAAP///wAAgIDg/59//////QAAcHD4AP//AAD/fwAHf///DwMAAAA/////gAAAA4ePj4+PBwcBAcOH
+Dx8/fx4IAPD4+Pz+/////w8AAAAAAODcfj8//wDA////PwAAZjEchuPw+P4cPDx4+PDw8AAA//8fPz8/
+fxMAAAN/f38AAID///8A/wADBw8ff38fAP//Bwf/AAAAMDHPjw8fHwDw+Pj4gMD8fwAA//8B/wMAAAAP
+f////z4+fnx48MCA/Pj48PDw8PAA//9/BwH4AD8fH///AAAAAAADD3///wcA/v+AAAD//wAAAPj/f4D/
+/////wAAAAD//+AA4AEf/wD/Dw//PwMAAD///vz4gAAAAP////8MAPz8+PhwcHDgPwAAAP7/B/9+AAAA
+AP///////38HAQAAPwcPDwF/P39/f358fPAAAP////jAAAAA////8AAAAPz//wAP//MAADg4gODw+Pz+
+////f34AAAB/Pz9/DwMAAB8fP39/fwAA///w4ACA8Px/fzsAAACP/wB//gAAA///AAF///9/AQB/fz8/
+Hx9/f////w/8AAAAAAABAx9/f/9/HY2BgY+HhwCA4Ph8fH8/AP//AwEDPz8AAIOP/w8P/+HBw4eHDx8/
+AwcHB8fHx8c/H4+Hg8PA4AAAwP//P39/AAP/D///AAA/AQAA//93Bz8fDw8PHx8fAIDw8Pj4/PwA4AAA
+/P///wF7BwMDD///AwNvfw8PDwcAAQcHH3///38AAAAA////AICA4Pj8//8AgIDB/38/Px8/ffvgIGBg
+APj4+IAA//8A+AAA/gP/////////////AAD8AP///wD///kAwIDA/j9+fHjw4MCAP39/Pw8DAAAAgMBg
+eH///z8+/Pj4gADwHx8Pj4eHgwN8fAAAAH///wAAA39/f38Pfnx8+PDw4AAAAAB//39/fz8D/+AAwIb/
+AP////gA4AAA4PBwcDj//38/Dw9/4QAAAAABD3////9/f3//BwAAAHgwkODw+Pz8f394eODgwMAAAB9/
+Dx//Dz9/f3x8fAwA///gAAAA/////vz8wAAA8D9/fwMAAHj+fwD/AAD//wH///8A/PAAAAAB/39/HwcB
+AwcPHz8fDwcAAw//fx8PBz9///7ggAAAPz9/f38AAAA/f3wAAAD7/wAA////fwAAAP//gP//AAD///z4
+8ODgAD8fDwcHBw//AKDhQwcff/8AAAAAB////wD//wAAP/iPAP8AAAAP//8AAvzwgw9////4AAD///gA
+////AAAAcH8AAAABfz8//zlhw4cHDx8/AAAH/z9//wB8fHzgADz8/ADA4MDA4P//AAAAf////////gAA
+/ukD8wAAAwd/f3//fx////gAAAD8+Pj4eHBwcACAgP//Dz//AQcPDz9/bw8A/v8PH38BAP////6AgAAA
+AP8A//8A+AADx38/PwQE/ADAeAD///8AAADg/P//gPw/Hx8f/wcAAAcPP///BwAAAPj/AID//wB/f39/
+/AAAAAAHf//8wAx4AP//fw//AAB8PITc/Ph4MDwc/wAA//8AOJiYyOj4+Pw/f/9/DwAAAD9/////P8IA
+fwAAIH9///8Df/8HD/8AAP///wMAAAH/P3//BwcHAAB/Hw8PB2NjAQAHf3///wAAAAADfx8fP/8/AAAA
+Af///wD/DwMHBw///Pj4+PDw8OD//uEPfvCAAAAAAH9//38fAP8DAP8DD/8AgPD8/v8A/AM+AQf/DwD/
+//sD//gAAAAAAP//fwP/AADBgwcHH3//f38PDwcHBwcAwOCA8Pz//wAAAw9/fx9/AAD+/////wAAAF//
+Dx8ffz8///nBAQB//////wAAAAAfP3/88OCAAAAAf/8HBw//eHh4eHh4+PgA8Bj//wCg/wCAwAD/A///
+AP0Hf39/f38/BwAABg///z9/HwcHPz8/AGD/fz788AA=
+""" )
+
+
+def load_default_medoids():
+    """Return the embedded default medoid set (1024x8 uint8).
+
+    Returns an array of shape (1024, 8) with dtype uint8.
+    """
+    import base64
+    data = base64.b64decode(EMBEDDED_DEFAULT_MEDOIDS_B64)
+    arr = np.frombuffer(data, dtype=np.uint8).reshape(-1, 8)
+    if arr.shape[0] != 1024:
+        raise ValueError(f"Embedded default medoids have wrong shape {arr.shape}")
+
+    # Ensure the zero-anchor invariant
+    zero_pattern = np.zeros(8, dtype=np.uint8)
+    if not np.array_equal(arr[0], zero_pattern):
+        found = False
+        for j in range(1, arr.shape[0]):
+            if np.array_equal(arr[j], zero_pattern):
+                arr[j] = arr[0].copy()
+                arr[0] = zero_pattern
+                found = True
+                break
+        if not found:
+            arr[0] = zero_pattern
+
+    return arr
+
+
 def main():
     parser = argparse.ArgumentParser(description="K2 MEMTEXT animation converter")
     parser.add_argument('--animation', type=str, required=True, help='Input directory for animation frames')
@@ -239,6 +412,13 @@ def main():
              'completely covered. Uses equal cropping on both sides of the ' \
              'overflowing dimension. By default images are padded with black.'
     )
+    parser.add_argument(
+        '--default-medoids',
+        action='store_true',
+        help='Use the embedded default medoid set (built into convert_memtext.py). '
+             'When supplied, per-animation clustering is skipped and the embedded '
+             '1024 medoids are used in global mode.'
+    )
     args = parser.parse_args()
 
     # honour new cropping flag
@@ -264,11 +444,19 @@ def main():
     if args.encoding_mode == 'global':
         if n_coherence > 0:
             print("Note: --coherence-medoids is ignored in global mode (all medoids are already global)")
+        precomputed_medoids = None
+        if args.default_medoids:
+            print("  Using embedded default medoids (built into convert_memtext.py)")
+            precomputed_medoids = load_default_medoids()
         print("MEMTEXT global mode: 256-color palette, 1024 medoids in 4 font sets, shared across all frames")
+        if precomputed_medoids is not None:
+            print("  Medoid source: embedded default (skipping per-animation clustering)")
         frames_data = process_animation_frames_memtext_global(
             args.animation, high_quality=high_quality, split_palette=split_palette,
-            denoise=denoise)
+            denoise=denoise, medoids_arr=precomputed_medoids)
     elif args.encoding_mode == 'hybrid':
+        if args.default_medoids:
+            print("Warning: --default-medoids is only supported with --encoding-mode global; ignoring")
         print("MEMTEXT hybrid mode: global 256-color palette, per-frame 512 medoids in 2 font sets")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
@@ -276,6 +464,8 @@ def main():
             args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette,
             denoise=denoise)
     else:
+        if args.default_medoids:
+            print("Warning: --default-medoids is only supported with --encoding-mode global; ignoring")
         print("MEMTEXT frame mode: per-frame 256-color palette, 512 medoids in 2 font sets, double-buffered LUT/font IDs")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
@@ -1436,7 +1626,8 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
     return tile_assignments
 
 
-def process_animation_frames_memtext_global(input_dir, high_quality=False, split_palette=False, denoise=0):
+def process_animation_frames_memtext_global(input_dir, high_quality=False, split_palette=False, denoise=0,
+                                             medoids_arr=None):
     """Process animation frames in MEMTEXT mode.
     
     Key differences from regular animation mode:
@@ -1450,6 +1641,9 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
         high_quality: if True, use reconstruction-error tile matching
         split_palette: if True, derive separate FG/BG palettes (512 total colors)
         denoise: max island size to remove from medoids (0=disabled)
+        medoids_arr: optional np.array (1024, 8) uint8 — precomputed medoids loaded
+            from a .npy file.  When provided, the per-animation clustering step is
+            skipped and these medoids are used directly (after optional denoising).
     """
     # Find all image files
     image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp', '*.tiff']
@@ -1489,12 +1683,18 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
     
     print(f"Extracted {len(all_tiles)} total tiles")
     
-    # Step 3: Cluster to 1024 medoids
-    print("Clustering to 1024 medoids...")
-    clustered_medoids = derive_medoids_from_tiles(all_tiles, 1024, palette)
-    if denoise > 0:
-        clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
-    print(f"Created {len(clustered_medoids)} medoids")
+    # Step 3: Derive 1024 medoids (cluster from tiles, or use precomputed set)
+    if medoids_arr is not None:
+        print(f"Using precomputed medoids ({len(medoids_arr)} patterns) — skipping per-animation clustering")
+        clustered_medoids = medoids_arr.copy()
+        if denoise > 0:
+            clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
+    else:
+        print("Clustering to 1024 medoids...")
+        clustered_medoids = derive_medoids_from_tiles(all_tiles, 1024, palette)
+        if denoise > 0:
+            clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
+    print(f"Using {len(clustered_medoids)} medoids")
     
     # Split into 4 font sets of 256 each
     font_sets = [clustered_medoids[i*256:(i+1)*256] for i in range(4)]
