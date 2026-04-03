@@ -11,6 +11,15 @@ from sklearn.cluster import KMeans
 
 # Global configuration flags set by command-line arguments
 CROP_TO_FILL = False  # when True, images are scaled and then center-cropped to exactly 640×480
+# Medoid derivation method (can be overridden from CLI)
+MEDOID_METHOD = 'legacy'  # choices: 'legacy', 'oklab_kmeans', 'oklab_kmedoids_clara'
+MEDOID_CANDIDATES = 1
+# CLARA+PAM defaults (can be overridden via CLI)
+MEDOID_CLARA_SUBSAMPLES = 3
+MEDOID_CLARA_SUBSAMPLE_SIZE = 5000
+MEDOID_PAM_SWAP_BUDGET = 500
+MEDOID_EVAL_SAMPLE_SIZE = 5000
+MEDOID_CLARA_SEED = 42
 
 # Optional: prefer cuML KMeans if available (GPU acceleration). Fallback to sklearn KMeans.
 try:
@@ -27,6 +36,27 @@ try:
 except Exception:
     numba = None
     _USE_NUMBA = False
+
+
+def palette_list_index_to_chunk_id(idx, fg_count):
+    """Map an index within a combined FG+BG palette list to a chunk ID.
+
+    The combined list is expected to be [fg0, fg1, ..., bg0, bg1, ...].
+    FG entries are assigned chunk IDs starting at 0; BG entries start at 2.
+    """
+    if idx < fg_count:
+        return int(idx)
+    return 0x02 + int(idx - fg_count)
+
+
+def lut_id_to_fg_bg_chunk_ids(lut_id):
+    """Return (fg_chunk_id, bg_chunk_id) for a given lut_id (0/1).
+
+    This implements the double-buffering convention: fg = (lut_id & 1),
+    bg = 2 + (lut_id & 1).
+    """
+    sel = int(lut_id & 0x01)
+    return sel, 0x02 + sel
 
 def make_kmeans(n_clusters, **kwargs):
     """Return a KMeans instance. Uses cuML if available, otherwise sklearn's KMeans.
@@ -406,9 +436,15 @@ def main():
              'Typical values: 1 (conservative) or 2 (moderate).'
     )
     parser.add_argument(
+        '--four-color-luts',
+        action='store_true',
+        help='Enable per-tile selection of 2 FG + 2 BG 256-color LUTs (uses bits 10/11 in char word)'
+    )
+    # Medoid tuning flags removed; medoid method is implied by --high-quality
+    parser.add_argument(
         '--crop-to-fill',
         action='store_true',
-        help='Scale and then centre-crop input images so the 640×480 canvas is ' \
+        help='Scale and then center-crop input images so the 640×480 canvas is ' \
              'completely covered. Uses equal cropping on both sides of the ' \
              'overflowing dimension. By default images are padded with black.'
     )
@@ -420,6 +456,18 @@ def main():
              '1024 medoids are used in global mode.'
     )
     args = parser.parse_args()
+
+    # Frame encoding mode cannot be used with four-color LUTs because
+    # palettes are double-buffered on the target; report an error to the user.
+    if args.encoding_mode == 'frame' and args.four_color_luts:
+        parser.error("--four-color-luts is not supported with --encoding-mode frame")
+
+    # Set medoid method globally for helper functions
+    # High-quality now uses the perceptual KMeans medoid derivation
+    # (`derive_medoids_oklab_kmeans`) which is faster and perceptually similar
+    # to CLARA+PAM. Otherwise use legacy method.
+    global MEDOID_METHOD
+    MEDOID_METHOD = 'oklab_kmeans' if args.high_quality else 'legacy'
 
     # honour new cropping flag
     global CROP_TO_FILL
@@ -448,25 +496,25 @@ def main():
         if args.default_medoids:
             print("  Using embedded default medoids (built into convert_memtext.py)")
             precomputed_medoids = load_default_medoids()
-        print("MEMTEXT global mode: 256-color palette, 1024 medoids in 4 font sets, shared across all frames")
+        print("MEMTEXT global mode: global palette, 1024 medoids in 4 font sets, shared across all frames")
         if precomputed_medoids is not None:
             print("  Medoid source: embedded default (skipping per-animation clustering)")
         frames_data = process_animation_frames_memtext_global(
             args.animation, high_quality=high_quality, split_palette=split_palette,
-            denoise=denoise, medoids_arr=precomputed_medoids)
+            denoise=denoise, medoids_arr=precomputed_medoids, four_color_luts=args.four_color_luts)
     elif args.encoding_mode == 'hybrid':
         if args.default_medoids:
             print("Warning: --default-medoids is only supported with --encoding-mode global; ignoring")
-        print("MEMTEXT hybrid mode: global 256-color palette, per-frame 512 medoids in 2 font sets")
+        print("MEMTEXT hybrid mode: global palette(s), per-frame 512 medoids in 2 font sets")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
         frames_data = process_animation_frames_memtext_hybrid(
             args.animation, n_coherence=n_coherence, high_quality=high_quality, split_palette=split_palette,
-            denoise=denoise)
+            denoise=denoise, four_color_luts=args.four_color_luts)
     else:
         if args.default_medoids:
             print("Warning: --default-medoids is only supported with --encoding-mode global; ignoring")
-        print("MEMTEXT frame mode: per-frame 256-color palette, 512 medoids in 2 font sets, double-buffered LUT/font IDs")
+        print("MEMTEXT frame mode: per-frame palette(s), 512 medoids in 2 font sets, double-buffered LUT/font IDs")
         if n_coherence > 0:
             print(f"  Coherence: reserving {n_coherence} of 512 medoid slots for cross-frame stability")
         frames_data = process_animation_frames_memtext_frame(
@@ -484,6 +532,7 @@ def main():
         frame_duration=args.frame_duration,
         use_rle=args.rle,
         encoding_mode=args.encoding_mode,
+        four_color_luts=args.four_color_luts,
     )
     print("MEMTEXT animation conversion completed successfully!")
 
@@ -573,6 +622,67 @@ def rgb_to_lab(rgb):
     return lab
 
 
+def rgb_to_oklab(rgb):
+    """Convert RGB (uint8 0..255 or float 0..255) to Oklab (L,a,b).
+
+    Vectorized NumPy implementation. Input shape (...,3). Returns same shape.
+    """
+    arr = rgb.astype(np.float32) / 255.0
+
+    # linearize sRGB
+    mask = arr <= 0.04045
+    lin = np.where(mask, arr / 12.92, np.power((arr + 0.055) / 1.055, 2.4))
+
+    # Linear transform to LMS
+    l = 0.4122214708 * lin[..., 0] + 0.5363325363 * lin[..., 1] + 0.0514459929 * lin[..., 2]
+    m = 0.2119034982 * lin[..., 0] + 0.6806995451 * lin[..., 1] + 0.1073969566 * lin[..., 2]
+    s = 0.0883024619 * lin[..., 0] + 0.2817188376 * lin[..., 1] + 0.6299787005 * lin[..., 2]
+
+    # cube root
+    l_ = np.cbrt(l)
+    m_ = np.cbrt(m)
+    s_ = np.cbrt(s)
+
+    L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+    a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+    b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+
+    lab = np.stack([L, a, b], axis=-1)
+    return lab
+
+
+def merge_palettes_for_medoids(fg_palettes, bg_palettes):
+    """Merge multiple 256-entry palettes into a unique palette for medoid derivation.
+
+    Skips palette index 0 (transparent) when present. Returns an (N,3) uint8 array
+    of unique colors.
+    """
+    parts = []
+    if fg_palettes is not None:
+        for p in fg_palettes:
+            if p is None:
+                continue
+            if p.shape[0] == 256:
+                parts.append(p[1:])
+            else:
+                parts.append(p)
+    if bg_palettes is not None:
+        for p in bg_palettes:
+            if p is None:
+                continue
+            if p.shape[0] == 256:
+                parts.append(p[1:])
+            else:
+                parts.append(p)
+
+    if not parts:
+        return np.zeros((256, 3), dtype=np.uint8)
+
+    merged = np.vstack(parts).astype(np.uint8)
+    merged_unique = np.unique(merged, axis=0)
+    return merged_unique
+
+
 def invert_pattern(pattern):
     """Invert an 8-byte pattern (XOR each byte with 0xFF)."""
     return np.array([b ^ 0xFF for b in pattern], dtype=np.uint8)
@@ -616,25 +726,27 @@ def create_memtext_256_color_palette(image_files):
     
     all_pixels = np.vstack(all_pixels).astype(np.float32)
     print(f"  Sampled {len(all_pixels)} pixels from {len(image_files)} frames")
-    
-    # Remove duplicates
+
+    # Legacy behaviour: cluster on sampled pixels (preserve frequency weighting)
+    # but guard against too few distinct colors.
     unique_pixels = np.unique(all_pixels, axis=0)
     print(f"  Found {len(unique_pixels)} unique colors")
-    
-    # Cluster to 255 colors (leaving index 0 for transparency)
-    n_clusters = min(255, len(unique_pixels))
-    if n_clusters < 255:
-        # If fewer unique colors, use them directly
+
+    if len(all_pixels) < 255:
+        # Not enough sampled pixels; fall back to unique colors
+        n_clusters = min(255, len(unique_pixels))
         palette = np.zeros((256, 3), dtype=np.uint8)
-        palette[1:n_clusters+1] = unique_pixels[:n_clusters].astype(np.uint8)
-        # Pad with grey
+        if n_clusters > 0:
+            palette[1:n_clusters+1] = unique_pixels[:n_clusters].astype(np.uint8)
         for i in range(n_clusters+1, 256):
             palette[i] = [128, 128, 128]
     else:
+        # Cluster on the sampled pixels (not the deduplicated set) to match
+        # legacy behaviour where color frequency influences centroids.
         kmeans = make_kmeans(n_clusters=255, random_state=42, n_init=10)
-        kmeans.fit(unique_pixels)
+        kmeans.fit(all_pixels)
         centers = kmeans.cluster_centers_.astype(np.uint8)
-        
+
         palette = np.zeros((256, 3), dtype=np.uint8)
         # Index 0 reserved for transparency (black)
         palette[1:256] = centers
@@ -647,19 +759,23 @@ def create_memtext_256_color_palette_from_image(image):
     """Create a 256-color palette from one scaled frame image."""
     img_np = np.array(image, dtype=np.uint8)
     pixels = img_np.reshape(-1, 3)
-    unique_pixels = np.unique(pixels.astype(np.float32), axis=0)
+    # Cluster on per-pixel samples (legacy behaviour) but guard for too few
+    # distinct colors in the single frame.
+    pixels_f = pixels.astype(np.float32)
+    unique_pixels = np.unique(pixels_f, axis=0)
 
-    n_clusters = min(255, len(unique_pixels))
-    palette = np.zeros((256, 3), dtype=np.uint8)
-
-    if n_clusters < 255:
-        palette[1:n_clusters + 1] = unique_pixels[:n_clusters].astype(np.uint8)
+    if len(pixels_f) < 255:
+        n_clusters = min(255, len(unique_pixels))
+        palette = np.zeros((256, 3), dtype=np.uint8)
+        if n_clusters > 0:
+            palette[1:n_clusters + 1] = unique_pixels[:n_clusters].astype(np.uint8)
         for i in range(n_clusters + 1, 256):
             palette[i] = [128, 128, 128]
     else:
         kmeans = make_kmeans(n_clusters=255, random_state=42, n_init=10)
-        kmeans.fit(unique_pixels)
+        kmeans.fit(pixels_f)
         centers = kmeans.cluster_centers_.astype(np.uint8)
+        palette = np.zeros((256, 3), dtype=np.uint8)
         palette[1:256] = centers
 
     return palette
@@ -688,7 +804,7 @@ def _split_tile_fg_bg_centers(img_np):
     return fg_centers, bg_centers
 
 
-def _cluster_centers_to_palette(centers_arr, label):
+def _cluster_centers_to_palette(centers_arr, label, seed=42):
     """Cluster a set of color centers to a 256-entry palette (index 0 reserved)."""
     unique = np.unique(centers_arr.astype(np.uint8), axis=0).astype(np.float32)
     n = min(255, len(unique))
@@ -698,10 +814,62 @@ def _cluster_centers_to_palette(centers_arr, label):
         for i in range(n + 1, 256):
             palette[i] = [128, 128, 128]
     else:
-        kmeans = make_kmeans(n_clusters=255, random_state=42, n_init=10)
+        kmeans = make_kmeans(n_clusters=255, random_state=seed, n_init=10)
         kmeans.fit(unique)
         palette[1:256] = kmeans.cluster_centers_.astype(np.uint8)
     return palette
+
+
+def _split_centers_two_palettes(centers_arr, label, seed=42):
+    """Cluster into ~510 colors and split between two 256-entry LUT palettes.
+
+    Runs KMeans with up to 510 clusters, then sorts the resulting centroids by
+    luminance and splits them evenly: the darker half goes to LUT0 and the
+    brighter half to LUT1.  This means each pair of LUTs together covers ~510
+    distinct colors while remaining individually coherent, unlike two independent
+    KMeans-255 runs which converge to nearly identical palettes.
+
+    Returns (pal0, pal1) each (256, 3) uint8, index 0 reserved for transparency.
+    """
+    unique = np.unique(centers_arr.astype(np.uint8), axis=0).astype(np.float32)
+    n_unique = len(unique)
+
+    if n_unique <= 255:
+        # Too few distinct colors — share a single palette across both LUTs
+        single = _cluster_centers_to_palette(centers_arr, label, seed=seed)
+        return single.copy(), single.copy()
+
+    n_clusters = min(510, n_unique)
+    print(f"  KMeans({n_clusters} colors) for {label} split across 2 LUTs...")
+    kmeans = make_kmeans(n_clusters=n_clusters, random_state=seed, n_init=10)
+    kmeans.fit(unique)
+    all_c = np.clip(np.round(kmeans.cluster_centers_), 0, 255).astype(np.uint8)
+
+    # Sort by luminance so each LUT covers a contiguous brightness range.
+    # Sort by luminance then interleave: even-indexed → LUT0, odd-indexed → LUT1.
+    # Both LUTs cover the full luminance range with complementary colors, which is
+    # better for gradients and avoids the "wrong-LUT" miss that happens when
+    # the target color sits near the luminance boundary of a strict dark/bright split.
+    # For n_clusters=510: each LUT gets exactly 255 entries.
+    lum = (0.299 * all_c[:, 0].astype(np.float64)
+           + 0.587 * all_c[:, 1].astype(np.float64)
+           + 0.114 * all_c[:, 2].astype(np.float64))
+    order = np.argsort(lum)
+    all_c = all_c[order]  # sorted ascending by perceptual luminance
+
+    # positions 0,2,4,... → LUT0;  positions 1,3,5,... → LUT1
+    n0 = min(255, (n_clusters + 1) // 2)  # entries for LUT0
+    n1 = min(255, n_clusters // 2)         # entries for LUT1
+
+    pal0 = np.full((256, 3), 128, dtype=np.uint8)
+    pal1 = np.full((256, 3), 128, dtype=np.uint8)
+    pal0[0] = 0
+    pal1[0] = 0
+    pal0[1:n0 + 1] = all_c[0::2][:n0]
+    pal1[1:n1 + 1] = all_c[1::2][:n1]
+
+    print(f"    {label}: LUT0 {n0} + LUT1 {n1} interleaved colors (full luminance range in each LUT)")
+    return pal0, pal1
 
 
 def create_memtext_512_color_palette(image_files):
@@ -728,7 +896,7 @@ def create_memtext_512_color_palette(image_files):
 
     all_fg = np.array(all_fg, dtype=np.float32)
     all_bg = np.array(all_bg, dtype=np.float32)
-    print(f"  Collected {len(all_fg)} FG centres and {len(all_bg)} BG centres from {len(image_files)} frames")
+    print(f"  Collected {len(all_fg)} FG centers and {len(all_bg)} BG centers from {len(image_files)} frames")
 
     fg_palette = _cluster_centers_to_palette(all_fg, "FG")
     bg_palette = _cluster_centers_to_palette(all_bg, "BG")
@@ -745,6 +913,64 @@ def create_memtext_512_color_palette_from_image(image):
     fg_palette = _cluster_centers_to_palette(np.array(fg_c, dtype=np.float32), "FG")
     bg_palette = _cluster_centers_to_palette(np.array(bg_c, dtype=np.float32), "BG")
     return fg_palette, bg_palette
+
+
+def create_memtext_4lut_palettes(image_files, split_palette=False):
+    """Create two FG palettes and two BG palettes from an animation set.
+
+    Collects role-aware (luminance-split) per-tile FG/BG color centers from
+    ALL frames, then runs a single KMeans clustering with 510 targets for each
+    role.  The 510 resulting centroids are sorted by luminance and evenly split
+    between LUT0 (darker half) and LUT1 (brighter half).  Together, each pair
+    of LUTs provides ~510 distinct role-aware colors — approximately twice the
+    coverage of the 2-LUT split-palette mode.
+
+    The ``split_palette`` parameter is retained for API compatibility but is
+    effectively always True: role-aware splitting is always applied.
+
+    Returns (fg_palettes, bg_palettes) each a list [lut0, lut1] of (256,3) uint8.
+    """
+    print("Creating 4-LUT palettes (FG0/FG1, BG0/BG1) — role-aware, 510-color split...")
+    if not image_files:
+        raise ValueError("No image files provided for 4-LUT palette generation")
+
+    all_fg: list = []
+    all_bg: list = []
+    for image_file in image_files:
+        img = load_and_scale_image(image_file)
+        img_np = np.array(img, dtype=np.float32)
+        fg_c, bg_c = _split_tile_fg_bg_centers(img_np)
+        all_fg.extend(fg_c)
+        all_bg.extend(bg_c)
+
+    all_fg_arr = np.array(all_fg, dtype=np.float32)
+    all_bg_arr = np.array(all_bg, dtype=np.float32)
+    print(f"  Collected {len(all_fg_arr)} FG centers and {len(all_bg_arr)} BG centers from {len(image_files)} frames")
+
+    fg0, fg1 = _split_centers_two_palettes(all_fg_arr, "FG", seed=42)
+    bg0, bg1 = _split_centers_two_palettes(all_bg_arr, "BG", seed=42)
+
+    print("  Created FG0/FG1 (510-color FG split) and BG0/BG1 (510-color BG split)")
+    return [fg0, fg1], [bg0, bg1]
+
+
+def create_memtext_4lut_palettes_from_image(image, split_palette=False):
+    """Create two FG and two BG palettes from a single scaled image.
+
+    Collects per-tile luminance-split FG/BG centers, then uses a 510-center
+    KMeans split (luminance-sorted) to produce two complementary palettes per
+    role, consistent with the animation-sequence version.
+    """
+    img_np = np.array(image, dtype=np.float32)
+    fg_c, bg_c = _split_tile_fg_bg_centers(img_np)
+
+    all_fg_arr = np.array(fg_c, dtype=np.float32)
+    all_bg_arr = np.array(bg_c, dtype=np.float32)
+
+    fg0, fg1 = _split_centers_two_palettes(all_fg_arr, "FG", seed=42)
+    bg0, bg1 = _split_centers_two_palettes(all_bg_arr, "BG", seed=42)
+
+    return [fg0, fg1], [bg0, bg1]
 
 
 def extract_frame_tiles(image):
@@ -905,11 +1131,29 @@ def denoise_medoid_set(medoids, max_island_size):
     return cleaned
 
 
-def derive_medoids_from_tiles(frame_tiles, n_medoids, palette):
-    """Derive medoid patterns from frame tiles using canonicalized inversion-aware patterns."""
+def derive_medoids_from_tiles(frame_tiles, n_medoids, palette, fg_palette=None, bg_palette=None):
+    """Derive medoid patterns from frame tiles using canonicalized inversion-aware patterns.
+
+    Args:
+        frame_tiles: list of tile dicts with 'pixels' key.
+        n_medoids: desired number of output medoid patterns.
+        palette: (N, 3) uint8 reference palette (merged FG+BG for oklab methods).
+        fg_palette: optional (N_fg, 3) uint8 foreground palette for split-palette scoring.
+            May be a combined palette (e.g. both FG LUTs concatenated for 4LUT mode).
+        bg_palette: optional (N_bg, 3) uint8 background palette for split-palette scoring.
+            May be a combined palette (e.g. both BG LUTs concatenated for 4LUT mode).
+    """
     unique_canonical = {}
+    use_oklab = (MEDOID_METHOD != 'legacy')
+    palette_oklab = None
+    try:
+        if use_oklab:
+            palette_oklab = rgb_to_oklab(palette.astype(np.float32))
+    except Exception:
+        palette_oklab = None
+
     for tile in frame_tiles:
-        font_def, _, _ = optimize_character_memtext(tile['pixels'], palette)
+        font_def, _, _ = optimize_character_memtext(tile['pixels'], palette, palette_oklab=palette_oklab, use_oklab=use_oklab)
         canonical, _ = get_canonical_pattern(font_def)
         key = pattern_key(canonical)
         if key not in unique_canonical:
@@ -960,10 +1204,31 @@ def derive_medoids_from_tiles(frame_tiles, n_medoids, palette):
         except Exception:
             font_features = perceptual_descriptors
 
-        kmeans = make_kmeans(n_clusters=cluster_target, random_state=42, n_init=10)
-        kmeans.fit(font_features)
-        cluster_labels = kmeans.labels_
-        clustered_medoids = compute_medoids(patterns_arr, cluster_labels, cluster_target)
+        # Route to the requested perceptual medoid method
+        if MEDOID_METHOD == 'oklab_kmedoids_clara':
+            clustered_medoids = derive_medoids_clara_pam(
+                frame_tiles, cluster_target, palette,
+                subsamples=MEDOID_CLARA_SUBSAMPLES,
+                subsample_size=MEDOID_CLARA_SUBSAMPLE_SIZE,
+                candidates=max(2, MEDOID_CANDIDATES),
+                pam_budget=MEDOID_PAM_SWAP_BUDGET,
+                eval_size=MEDOID_EVAL_SAMPLE_SIZE,
+                seed=MEDOID_CLARA_SEED,
+                fg_palette=fg_palette, bg_palette=bg_palette)
+        elif MEDOID_METHOD == 'oklab_kmeans':
+            clustered_medoids = derive_medoids_oklab_kmeans(
+                frame_tiles, cluster_target, palette,
+                candidates=max(2, MEDOID_CANDIDATES),
+                fg_palette=fg_palette, bg_palette=bg_palette)
+        else:
+            # Legacy medoid derivation: perceptual KMeans on structural descriptors
+            kmeans = make_kmeans(n_clusters=cluster_target, random_state=42, n_init=10)
+            try:
+                kmeans.fit(font_features)
+            except TypeError:
+                kmeans.fit(font_features)
+            cluster_labels = kmeans.labels_
+            clustered_medoids = compute_medoids(patterns_arr, cluster_labels, cluster_target)
 
     if len(clustered_medoids) < n_medoids:
         pad_count = n_medoids - len(clustered_medoids)
@@ -998,8 +1263,16 @@ def extract_canonical_patterns(frame_tiles, palette):
         dict mapping pattern_key -> canonical np.array pattern
     """
     unique_canonical = {}
+    use_oklab = (MEDOID_METHOD != 'legacy')
+    palette_oklab = None
+    try:
+        if use_oklab:
+            palette_oklab = rgb_to_oklab(palette.astype(np.float32))
+    except Exception:
+        palette_oklab = None
+
     for tile in frame_tiles:
-        font_def, _, _ = optimize_character_memtext(tile['pixels'], palette)
+        font_def, _, _ = optimize_character_memtext(tile['pixels'], palette, palette_oklab=palette_oklab, use_oklab=use_oklab)
         canonical, _ = get_canonical_pattern(font_def)
         key = pattern_key(canonical)
         if key not in unique_canonical:
@@ -1061,6 +1334,830 @@ def cluster_patterns_to_medoids(patterns_arr, n_target):
     kmeans.fit(font_features)
     cluster_labels = kmeans.labels_
     return compute_medoids(patterns_arr, cluster_labels, n_target)
+
+
+def _pattern_bytes_to_mask(pattern_bytes):
+    """Convert 8-byte pattern to boolean mask of length 64 (row-major)."""
+    mask = np.zeros(64, dtype=np.bool_)
+    for r in range(8):
+        byte = int(pattern_bytes[r])
+        for c in range(8):
+            mask[r * 8 + c] = ((byte >> (7 - c)) & 1) != 0
+    return mask
+
+
+def _build_perceptual_cluster_features(pixel_means_oklab, struct_feats=None, perceptual_weight=8.0):
+    """Build per-pattern clustering feature matrix in perceptual (Oklab) space.
+
+    Uses per-position Oklab color means as the primary feature so that KMeans
+    groups patterns that *look* similar when rendered.  This aligns the
+    clustering objective with the Oklab reconstruction-error scoring metric and
+    consistently outperforms structural byte/edge features for medoid selection.
+
+    Args:
+        pixel_means_oklab: (n, 64, 3) float32 — per-position Oklab means.
+        struct_feats: optional (n, m) float32 — pre-normalised structural features
+            appended with weight 1.0 for tiebreaking.
+        perceptual_weight: scaling applied to Oklab features (default 8.0).
+
+    Returns:
+        (n, ncols) float32 feature matrix ready for KMeans.
+    """
+    n = pixel_means_oklab.shape[0]
+    perc = pixel_means_oklab.reshape(n, 192).astype(np.float32) * float(perceptual_weight)
+    if struct_feats is not None:
+        return np.concatenate([perc, struct_feats.astype(np.float32)], axis=1)
+    return perc
+
+
+def _build_nn_palette_kernel():
+    """Build a Numba-JIT parallel nearest-palette lookup kernel (avoids big (n,p) allocation)."""
+    @numba.njit(cache=True, parallel=True)
+    def _nn_pal_idx(queries, pal, pal_norms):
+        """Return nearest-palette index for each query using parallel Numba loops.
+
+        Args:
+            queries  : (n, 3) float32 — query colors.
+            pal      : (p, 3) float32 — palette.
+            pal_norms: (p,)   float32 — precomputed palette squared norms.
+
+        Returns:
+            (n,) int64 — index into pal for each query.
+        """
+        n = queries.shape[0]
+        p = pal.shape[0]
+        result = np.empty(n, dtype=np.int64)
+        for i in numba.prange(n):
+            q0 = queries[i, 0]
+            q1 = queries[i, 1]
+            q2 = queries[i, 2]
+            qn = q0 * q0 + q1 * q1 + q2 * q2
+            best_d = np.inf
+            best_j = 0
+            for j in range(p):
+                d = qn + pal_norms[j] - 2.0 * (q0 * pal[j, 0] + q1 * pal[j, 1] + q2 * pal[j, 2])
+                if d < best_d:
+                    best_d = d
+                    best_j = j
+            result[i] = best_j
+        return result
+    return _nn_pal_idx
+
+
+if _USE_NUMBA:
+    _nn_pal_idx_jit = _build_nn_palette_kernel()
+    # Warm-up: trigger JIT compilation now at module load time (avoids first-call latency)
+    _dummy_q = np.zeros((4, 3), dtype=np.float32)
+    _dummy_p = np.zeros((4, 3), dtype=np.float32)
+    _dummy_n = np.zeros(4, dtype=np.float32)
+    _nn_pal_idx_jit(_dummy_q, _dummy_p, _dummy_n)
+    del _dummy_q, _dummy_p, _dummy_n
+else:
+    _nn_pal_idx_jit = None
+
+
+def _nn_palette_colors(means, palette_oklab, pal_norms=None):
+    """Nearest-palette-color lookup via squared-distance BLAS matmul.
+
+    Uses ||a - b||^2 = ||a||^2 - 2*(a·b) + ||b||^2 to avoid allocating a
+    large (n, p, 3) broadcast temporary.  Much faster than np.linalg.norm
+    for large n_eval × p comparisons.
+
+    Args:
+        means: (n, 3) float32 — query colors.
+        palette_oklab: (p, 3) float32 — palette.
+        pal_norms: (p,) float32 precomputed palette squared-norms, or None.
+
+    Returns:
+        (n, 3) float32 — nearest palette color for each query.
+    """
+    if pal_norms is None:
+        pal_norms = (palette_oklab * palette_oklab).sum(axis=1)   # (p,)
+    mean_norms = (means * means).sum(axis=1)                      # (n,)
+    dots = means @ palette_oklab.T                                # (n, p) via BLAS
+    dists_sq = mean_norms[:, None] + pal_norms[None, :] - 2.0 * dots
+    return palette_oklab[np.argmin(dists_sq, axis=1)]             # (n, 3)
+
+
+def _compute_cost_column_oklab(pattern_bytes, pixel_means_oklab_eval, palette_oklab,
+                                fg_palette_oklab=None, bg_palette_oklab=None,
+                                fg_pal_norms=None, bg_pal_norms=None):
+    """Compute per-pattern Oklab reconstruction cost for one candidate medoid.
+
+    For each pattern in the evaluation set, the candidate medoid's FG/BG mask
+    is applied to the per-position Oklab means; the nearest palette color is
+    chosen for each group and the total squared Oklab error is returned.
+
+    Args:
+        pattern_bytes: (8,) uint8 — candidate medoid.
+        pixel_means_oklab_eval: (n_eval, 64, 3) float32.
+        palette_oklab: (p, 3) float32 — fallback palette (both FG and BG).
+        fg_palette_oklab: optional (p_fg, 3) float32 — FG palette.
+        bg_palette_oklab: optional (p_bg, 3) float32 — BG palette.
+        fg_pal_norms: optional (p_fg,) float32 precomputed FG palette squared-norms.
+        bg_pal_norms: optional (p_bg,) float32 precomputed BG palette squared-norms.
+
+    Returns:
+        (n_eval,) float64 cost per pattern.
+    """
+    pal_fg = fg_palette_oklab if fg_palette_oklab is not None else palette_oklab
+    pal_bg = bg_palette_oklab if bg_palette_oklab is not None else palette_oklab
+    mask = _pattern_bytes_to_mask(pattern_bytes)
+    fg_pos = mask
+    bg_pos = ~mask
+    n_eval = pixel_means_oklab_eval.shape[0]
+    cost = np.zeros(n_eval, dtype=np.float64)
+
+    if fg_pos.sum() > 0:
+        fg_means = pixel_means_oklab_eval[:, fg_pos, :].mean(axis=1)   # (n_eval, 3)
+        fg_colors = _nn_palette_colors(fg_means, pal_fg, fg_pal_norms)
+        dif = pixel_means_oklab_eval[:, fg_pos, :] - fg_colors[:, None, :]
+        cost += (dif * dif).sum(axis=(1, 2))
+
+    if bg_pos.sum() > 0:
+        bg_means = pixel_means_oklab_eval[:, bg_pos, :].mean(axis=1)
+        bg_colors = _nn_palette_colors(bg_means, pal_bg, bg_pal_norms)
+        dif = pixel_means_oklab_eval[:, bg_pos, :] - bg_colors[:, None, :]
+        cost += (dif * dif).sum(axis=(1, 2))
+
+    return cost
+
+
+def _build_cost_matrix_batched(patterns_arr, eval_px, pal_fg, pal_bg,
+                                fg_pal_norms=None, bg_pal_norms=None,
+                                batch_size=32):
+    """Build full (n_eval, k) cost matrix for all medoid patterns simultaneously.
+
+    Vectorized replacement for looping _compute_cost_column_oklab k times.
+    Uses BLAS matmul: (n_eval, 64) @ (64, k) to compute weighted position means
+    for ALL k medoids at once, then computes nearest-palette in batches to
+    keep peak memory bounded.
+
+    The quadratic identity ||a - b||^2 = ||a||^2 - 2*(a·b) + ||b||^2 is used
+    so the sum of squared deviations reduces to three BLAS/element-wise terms.
+
+    Args:
+        patterns_arr: (k, 8) uint8 — medoid patterns.
+        eval_px: (n_eval, 64, 3) float32 — eval pattern pixel means in Oklab.
+        pal_fg: (p_fg, 3) float32 — FG palette in Oklab.
+        pal_bg: (p_bg, 3) float32 — BG palette in Oklab.
+        fg_pal_norms: (p_fg,) float32 precomputed FG palette squared-norms, or None.
+        bg_pal_norms: (p_bg,) float32 precomputed BG palette squared-norms, or None.
+        batch_size: medoids per mini-batch for nearest-palette lookup.
+
+    Returns:
+        cost_matrix: (n_eval, k) float64.
+    """
+    k = len(patterns_arr)
+    n_eval = eval_px.shape[0]
+
+    # Precompute all FG/BG masks as float32 weight matrices (k, 64)
+    all_masks_fg = np.array(
+        [_pattern_bytes_to_mask(patterns_arr[j]) for j in range(k)],
+        dtype=np.float32)
+    all_masks_bg = 1.0 - all_masks_fg
+    fg_counts = all_masks_fg.sum(axis=1)   # (k,) number of FG positions
+    bg_counts = all_masks_bg.sum(axis=1)   # (k,)
+
+    # Ensure float32 for BLAS; avoid copy if already float32
+    eval_f32 = eval_px if eval_px.dtype == np.float32 else eval_px.astype(np.float32)
+
+    # Sum-of-squared pixel values per position: (n_eval, 64) — computed once
+    eval_sq = (eval_f32 * eval_f32).sum(axis=2)  # (n_eval, 64)
+
+    # eval_sq_sum[i, j] = sum_p weight[j,p] * sum_c eval_px[i,p,c]^2
+    #   = BLAS (n_eval, 64) @ (64, k)  →  (n_eval, k)
+    eval_sq_sum_fg = (eval_sq @ all_masks_fg.T).astype(np.float64)   # (n_eval, k)
+    eval_sq_sum_bg = (eval_sq @ all_masks_bg.T).astype(np.float64)   # (n_eval, k)
+
+    # Per-channel summed pixel values over FG/BG positions:
+    # fg_sums[i, j, c] = sum_p mask_fg[j,p] * eval_px[i, p, c]
+    #   = BLAS (n_eval, 64) @ (64, k)  per channel  →  (n_eval, k)  ×3
+    fg_safe = np.where(fg_counts > 0, fg_counts, 1.0).astype(np.float32)
+    bg_safe = np.where(bg_counts > 0, bg_counts, 1.0).astype(np.float32)
+
+    fg_sums = np.stack(
+        [eval_f32[:, :, c] @ all_masks_fg.T for c in range(3)],
+        axis=2)  # (n_eval, k, 3) — pixel sum over FG positions per medoid
+    bg_sums = np.stack(
+        [eval_f32[:, :, c] @ all_masks_bg.T for c in range(3)],
+        axis=2)
+
+    # FG/BG means: divide by position counts  (n_eval, k, 3)
+    fg_means = (fg_sums / fg_safe[None, :, None]).astype(np.float32)
+    bg_means = (bg_sums / bg_safe[None, :, None]).astype(np.float32)
+
+    # Nearest-palette lookup: Numba parallel (no large (n,p) allocation) when available;
+    # fall back to mini-batched numpy otherwise.
+    n_tot = n_eval * k
+    if _nn_pal_idx_jit is not None:
+        # One-shot: flatten (n_eval, k, 3) → (n_eval*k, 3), run numba, reshape to (n_eval, k)
+        if fg_pal_norms is None:
+            fg_pal_norms_f = (pal_fg * pal_fg).sum(axis=1)
+        else:
+            fg_pal_norms_f = np.asarray(fg_pal_norms, dtype=np.float32)
+        if bg_pal_norms is None:
+            bg_pal_norms_f = (pal_bg * pal_bg).sum(axis=1)
+        else:
+            bg_pal_norms_f = np.asarray(bg_pal_norms, dtype=np.float32)
+
+        fg_flat = np.ascontiguousarray(fg_means.reshape(n_tot, 3))
+        fg_idx = _nn_pal_idx_jit(fg_flat, pal_fg, fg_pal_norms_f)   # (n_eval*k,) int64
+        fg_colors = pal_fg[fg_idx].reshape(n_eval, k, 3)             # (n_eval, k, 3)
+
+        bg_flat = np.ascontiguousarray(bg_means.reshape(n_tot, 3))
+        bg_idx = _nn_pal_idx_jit(bg_flat, pal_bg, bg_pal_norms_f)
+        bg_colors = pal_bg[bg_idx].reshape(n_eval, k, 3)
+    else:
+        fg_colors = np.zeros((n_eval, k, 3), dtype=np.float32)
+        bg_colors = np.zeros((n_eval, k, 3), dtype=np.float32)
+        for b_start in range(0, k, batch_size):
+            b_end = min(b_start + batch_size, k)
+            bsz = b_end - b_start
+            n_q = n_eval * bsz
+            fg_q = np.ascontiguousarray(fg_means[:, b_start:b_end, :].reshape(n_q, 3))
+            fg_colors[:, b_start:b_end, :] = (
+                _nn_palette_colors(fg_q, pal_fg, fg_pal_norms).reshape(n_eval, bsz, 3))
+            bg_q = np.ascontiguousarray(bg_means[:, b_start:b_end, :].reshape(n_q, 3))
+            bg_colors[:, b_start:b_end, :] = (
+                _nn_palette_colors(bg_q, pal_bg, bg_pal_norms).reshape(n_eval, bsz, 3))
+
+    # Quadratic error expansion for FG:
+    #   sum_{p in FG_j} ||eval_px[i,p] - fg_color[i,j]||^2
+    #   = eval_sq_sum_fg[i,j]
+    #     - 2 * fg_counts[j] * dot(fg_color[i,j], fg_means[i,j])
+    #     + fg_counts[j] * ||fg_color[i,j]||^2
+    # where fg_means[i,j] = fg_sums[i,j] / fg_counts[j]
+    # so:  fg_counts[j] * dot(fg_color, fg_means)
+    #     = dot(fg_color, fg_sums)  [element-wise sum over channels]
+    fg_sums_d = fg_sums.astype(np.float64)
+    fg_colors_d = fg_colors.astype(np.float64)
+    fg_dot = (fg_colors_d * fg_sums_d).sum(axis=2)             # (n_eval, k)
+    fg_color_sq = (fg_colors_d * fg_colors_d).sum(axis=2)      # (n_eval, k)
+    fg_error = np.where(
+        fg_counts > 0,
+        eval_sq_sum_fg - 2.0 * fg_dot + fg_color_sq * fg_counts,
+        0.0)
+
+    bg_sums_d = bg_sums.astype(np.float64)
+    bg_colors_d = bg_colors.astype(np.float64)
+    bg_dot = (bg_colors_d * bg_sums_d).sum(axis=2)
+    bg_color_sq = (bg_colors_d * bg_colors_d).sum(axis=2)
+    bg_error = np.where(
+        bg_counts > 0,
+        eval_sq_sum_bg - 2.0 * bg_dot + bg_color_sq * bg_counts,
+        0.0)
+
+    return fg_error + bg_error   # (n_eval, k) float64
+
+
+def _oklab_score_candidate(cand_pattern, member_px_oklab, member_counts, palette_oklab,
+                            fg_palette_oklab=None, bg_palette_oklab=None):
+    """Weighted Oklab reconstruction error for a candidate medoid pattern over cluster members.
+
+    Args:
+        cand_pattern: (8,) uint8.
+        member_px_oklab: (m, 64, 3) float32 — per-position Oklab means for cluster members.
+        member_counts: (m,) float32 — tile occurrence weights.
+        palette_oklab: (p, 3) float32 — fallback palette.
+        fg_palette_oklab: optional (p_fg, 3) float32.
+        bg_palette_oklab: optional (p_bg, 3) float32.
+
+    Returns:
+        float — weighted total reconstruction cost.
+    """
+    cost_col = _compute_cost_column_oklab(
+        cand_pattern, member_px_oklab, palette_oklab,
+        fg_palette_oklab, bg_palette_oklab)
+    return float((cost_col * member_counts.astype(np.float64)).sum())
+
+
+def _ensure_zero_medoid(medoids):
+    """Ensure medoids[0] is the all-zeros pattern (in-place).
+
+    Flat (single-color) tiles use font_set=0, char_idx=0, so position 0 must
+    always be the empty glyph.  If the all-zeros pattern already exists at
+    another position it is swapped; otherwise position 0 is replaced.
+    """
+    zero_pattern = np.zeros(8, dtype=np.uint8)
+    if np.array_equal(medoids[0], zero_pattern):
+        return
+    for j in range(1, len(medoids)):
+        if np.array_equal(medoids[j], zero_pattern):
+            medoids[j] = medoids[0].copy()
+            medoids[0] = zero_pattern
+            return
+    medoids[0] = zero_pattern
+
+
+def _collect_pattern_stats(frame_tiles, palette):
+    """Scan frame tiles and accumulate per-canonical-pattern pixel statistics.
+
+    Returns:
+        patterns_arr: (n, 8) uint8 — unique canonical patterns.
+        counts_arr  : (n,) float32 — tile occurrence counts.
+        pixel_means : (n, 64, 3) float32 — per-position RGB means.
+    """
+    pattern_index = {}
+    patterns = []
+    counts = []
+    pixel_sums = []
+    for tile in frame_tiles:
+        pix = tile['pixels'].astype(np.float32)
+        # Fast luminance-based canonical pattern — no palette lookup needed here.
+        # optimize_character_memtext's FG/BG split is driven solely by luminance
+        # thresholding; the palette indices it finds are NOT used below.
+        pix_flat = pix.reshape(-1, 3)  # normalise to (64, 3) regardless of input shape
+        lum = 0.299 * pix_flat[:, 0] + 0.587 * pix_flat[:, 1] + 0.114 * pix_flat[:, 2]  # (64,)
+        threshold = float(np.median(lum))
+        fg_row = (lum >= threshold).reshape(8, 8)
+        font_def = np.packbits(fg_row, axis=1).reshape(8).astype(np.uint8)
+        canonical, _ = get_canonical_pattern(font_def)
+        key = pattern_key(canonical)
+        if key not in pattern_index:
+            idx = len(patterns)
+            pattern_index[key] = idx
+            patterns.append(canonical)
+            counts.append(0)
+            pixel_sums.append(np.zeros((64, 3), dtype=np.float64))
+        idx = pattern_index[key]
+        counts[idx] += 1
+        pixel_sums[idx] += pix_flat
+
+    if not patterns:
+        return (np.zeros((0, 8), dtype=np.uint8),
+                np.zeros(0, dtype=np.float32),
+                np.zeros((0, 64, 3), dtype=np.float32))
+
+    patterns_arr = np.array(patterns, dtype=np.uint8)
+    counts_arr = np.array(counts, dtype=np.float32)
+    pixel_means = (np.array(pixel_sums, dtype=np.float32)
+                   / counts_arr[:, None, None])
+    return patterns_arr, counts_arr, pixel_means
+
+
+def derive_medoids_oklab_kmeans(frame_tiles, n_medoids, palette, candidates=5,
+                                fg_palette=None, bg_palette=None):
+    """Derive medoids via perceptual clustering + Oklab candidate scoring.
+
+    Key improvements over the prior implementation:
+
+    1. **Perceptual clustering space**: KMeans is run on per-position Oklab color
+       means (192-D) rather than PCA of structural byte features.  This aligns the
+       clustering objective with the Oklab reconstruction-error scoring metric so
+       patterns that *look* similar are grouped together.
+
+    2. **Count-weighted KMeans**: patterns appearing more frequently pull cluster
+       centers toward them, ensuring common tiles are well-covered.
+
+    3. **Full candidate evaluation**: evaluates `candidates` centroid-nearest
+       members AND the Hamming medoid of each cluster, then picks the one with
+       lowest weighted Oklab reconstruction error against cluster members.
+       (Prior default was candidates=1, making the scoring step a no-op.)
+
+    4. **Split-palette aware**: accepts separate fg_palette / bg_palette so
+       scoring uses the actual rendering palettes rather than a merged set.
+
+    Args:
+        frame_tiles: list of tile dicts.
+        n_medoids: desired medoid count.
+        palette: (N, 3) uint8 reference palette (merged when split mode is active).
+        candidates: number of centroid-nearest cluster members to score per cluster.
+        fg_palette: optional (N_fg, 3) uint8 FG palette for accurate scoring.
+            For 4LUT mode, pass the combined (~510-entry) FG palette so scoring
+            uses the full available color range.
+        bg_palette: optional (N_bg, 3) uint8 BG palette for accurate scoring.
+            For 4LUT mode, pass the combined (~510-entry) BG palette.
+    """
+    # ------------------------------------------------------------------ #
+    #  Step 1: collect canonical pattern stats                             #
+    # ------------------------------------------------------------------ #
+    patterns_arr, counts_arr, pixel_means = _collect_pattern_stats(frame_tiles, palette)
+
+    if len(patterns_arr) == 0:
+        return np.zeros((n_medoids, 8), dtype=np.uint8)
+
+    cluster_target = min(len(patterns_arr), n_medoids)
+    if cluster_target < n_medoids:
+        pad_count = n_medoids - len(patterns_arr)
+        out = np.vstack([patterns_arr,
+                         np.zeros((pad_count, 8), dtype=np.uint8)]) if pad_count > 0 else patterns_arr.copy()
+        _ensure_zero_medoid(out)
+        return out
+
+    n_unique = len(patterns_arr)
+
+    # ------------------------------------------------------------------ #
+    #  Step 2: build perceptual + structural feature matrix                #
+    # ------------------------------------------------------------------ #
+    palette_oklab = rgb_to_oklab(palette.astype(np.float32))
+    pixel_means_oklab = rgb_to_oklab(pixel_means.reshape(-1, 3)).reshape(n_unique, 64, 3)
+
+    fg_palette_oklab = (rgb_to_oklab(fg_palette.astype(np.float32))
+                        if fg_palette is not None else None)
+    bg_palette_oklab = (rgb_to_oklab(bg_palette.astype(np.float32))
+                        if bg_palette is not None else None)
+
+    # Structural: normalised raw bytes (low weight, for tiebreaking)
+    raw_bytes = patterns_arr.astype(np.float32)
+    raw_n = ((raw_bytes - raw_bytes.mean(axis=0))
+             / (raw_bytes.std(axis=0) + 1e-6))
+
+    font_features = _build_perceptual_cluster_features(
+        pixel_means_oklab, struct_feats=raw_n, perceptual_weight=8.0)
+
+    # ------------------------------------------------------------------ #
+    #  Step 3: count-weighted KMeans in perceptual feature space           #
+    # ------------------------------------------------------------------ #
+    kmeans = make_kmeans(n_clusters=cluster_target, random_state=42, n_init=10)
+    try:
+        kmeans.fit(font_features, sample_weight=counts_arr)
+    except TypeError:
+        kmeans.fit(font_features)
+    labels = kmeans.labels_
+    try:
+        centers = kmeans.cluster_centers_
+    except Exception:
+        centers = np.array([
+            font_features[labels == k].mean(axis=0) if np.any(labels == k) else font_features[0]
+            for k in range(cluster_target)
+        ])
+
+    # ------------------------------------------------------------------ #
+    #  Step 4: per-cluster candidate selection and Oklab scoring           #
+    # ------------------------------------------------------------------ #
+    medoids = []
+    for k in range(cluster_target):
+        member_idxs = np.where(labels == k)[0]
+        if len(member_idxs) == 0:
+            medoids.append(np.zeros(8, dtype=np.uint8))
+            continue
+
+        cand_set = set()
+
+        # a) Top-K members nearest the cluster centroid (in feature space)
+        fdists = np.linalg.norm(font_features[member_idxs] - centers[k], axis=1)
+        order = np.argsort(fdists)
+        n_cand = max(1, min(candidates, len(order)))
+        for ri in order[:n_cand]:
+            cand_set.add(int(member_idxs[ri]))
+
+        # b) Hamming medoid of the cluster (structure-level representative)
+        bitmats = np.array(
+            [_pattern_bytes_to_mask(patterns_arr[gi]).astype(np.uint8) for gi in member_idxs])
+        sums_k = bitmats.sum(axis=1).astype(np.int32)
+        overlap_k = bitmats.dot(bitmats.T)
+        ham_total = (sums_k[:, None] + sums_k[None, :] - 2 * overlap_k).sum(axis=1)
+        cand_set.add(int(member_idxs[int(np.argmin(ham_total))]))
+
+        # Score candidates: weighted Oklab error over cluster members
+        member_px = pixel_means_oklab[member_idxs]   # (m, 64, 3)
+        member_w = counts_arr[member_idxs]
+
+        best_cost = float('inf')
+        best_medoid = patterns_arr[member_idxs[0]]
+        for ci in cand_set:
+            cost = _oklab_score_candidate(
+                patterns_arr[ci], member_px, member_w,
+                palette_oklab, fg_palette_oklab, bg_palette_oklab)
+            if cost < best_cost:
+                best_cost = cost
+                best_medoid = patterns_arr[ci]
+        medoids.append(best_medoid)
+
+    # ------------------------------------------------------------------ #
+    #  Step 5: pad / truncate and enforce zero pattern at index 0          #
+    # ------------------------------------------------------------------ #
+    medoids = np.array(medoids, dtype=np.uint8)
+    if len(medoids) < n_medoids:
+        pad = np.zeros((n_medoids - len(medoids), 8), dtype=np.uint8)
+        medoids = np.vstack([medoids, pad])
+    elif len(medoids) > n_medoids:
+        medoids = medoids[:n_medoids]
+
+    _ensure_zero_medoid(medoids)
+    return medoids
+
+
+def _score_medoid_set(medoid_masks, pixel_means_oklab, counts_arr, palette_oklab,
+                      fg_palette_oklab=None, bg_palette_oklab=None,
+                      fg_pal_norms=None, bg_pal_norms=None):
+    """Compute total weighted Oklab reconstruction cost for a medoid set.
+
+    Each pattern is assigned to the medoid with minimum cost; the sum of
+    weighted minimum costs is returned.
+
+    Args:
+        medoid_masks: list of (64,) bool arrays.
+        pixel_means_oklab: (n, 64, 3) float32.
+        counts_arr: (n,) weights.
+        palette_oklab: (p, 3) float32 — fallback palette.
+        fg_palette_oklab: optional (p_fg, 3) float32.
+        bg_palette_oklab: optional (p_bg, 3) float32.
+        fg_pal_norms: optional (p_fg,) precomputed squared norms.
+        bg_pal_norms: optional (p_bg,) precomputed squared norms.
+    """
+    pal_fg = fg_palette_oklab if fg_palette_oklab is not None else palette_oklab
+    pal_bg = bg_palette_oklab if bg_palette_oklab is not None else palette_oklab
+    if fg_pal_norms is None:
+        fg_pal_norms = (pal_fg * pal_fg).sum(axis=1)
+    if bg_pal_norms is None:
+        bg_pal_norms = (pal_bg * pal_bg).sum(axis=1)
+    n_patterns = pixel_means_oklab.shape[0]
+    k = len(medoid_masks)
+    cost_matrix = np.full((n_patterns, k), np.inf, dtype=np.float64)
+
+    for j, raw_mask in enumerate(medoid_masks):
+        mask = np.asarray(raw_mask, dtype=bool)
+        fg_pos = mask
+        bg_pos = ~mask
+        cost = np.zeros(n_patterns, dtype=np.float64)
+
+        if fg_pos.sum() > 0:
+            fg_means = pixel_means_oklab[:, fg_pos, :].mean(axis=1)   # (n, 3)
+            chosen = _nn_palette_colors(fg_means, pal_fg, fg_pal_norms)
+            dif = pixel_means_oklab[:, fg_pos, :] - chosen[:, None, :]
+            cost += (dif * dif).sum(axis=(1, 2))
+
+        if bg_pos.sum() > 0:
+            bg_means = pixel_means_oklab[:, bg_pos, :].mean(axis=1)
+            chosen = _nn_palette_colors(bg_means, pal_bg, bg_pal_norms)
+            dif = pixel_means_oklab[:, bg_pos, :] - chosen[:, None, :]
+            cost += (dif * dif).sum(axis=(1, 2))
+
+        cost_matrix[:, j] = cost * counts_arr
+
+    return float(cost_matrix.min(axis=1).sum())
+
+
+def derive_medoids_clara_pam(frame_tiles, n_medoids, palette, subsamples=2, subsample_size=5000,
+                             candidates=5, pam_budget=200, eval_size=1000, seed=42,
+                             fg_palette=None, bg_palette=None):
+    """Derive medoids via CLARA subsampling + efficient delta-cost PAM refinement.
+
+    Key improvements over the prior implementation:
+
+    1. **Perceptual clustering**: CLARA KMeans runs on per-position Oklab means
+       (not PCA of structural bytes), so each subsample finds better cluster seeds.
+
+    2. **Count-weighted KMeans**: frequent patterns attract cluster centers.
+
+    3. **Richer candidate evaluation per cluster**: top-K centroid-nearest members
+       AND Hamming medoid are scored with the Oklab criterion.
+
+    4. **Efficient delta-cost PAM**: the cost matrix is computed once per PAM sweep;
+       each swap trial uses the previously cached matrix columns and the O(n_eval)
+       delta formula to test a proposed swap without recomputing the full scoring.
+       Non-medoids are ordered by occurrence count so that high-frequency patterns
+       are tried first, maximising early improvement.
+
+    5. **Split-palette aware**: optional fg_palette / bg_palette for accurate scoring.
+
+    Args:
+        frame_tiles: list of tile dicts.
+        n_medoids: desired medoid count.
+        palette: (N, 3) uint8 reference / merged palette.
+        subsamples: number of CLARA subsample KMeans runs.
+        subsample_size: max patterns per CLARA subsample.
+        candidates: cluster-local candidates to score per cluster.
+        pam_budget: max swap trials for PAM refinement.
+        eval_size: evaluation set size for CLARA run scoring.
+        seed: RNG seed.
+        fg_palette: optional (256, 3) uint8 FG palette for scoring.
+        bg_palette: optional (256, 3) uint8 BG palette for scoring.
+    """
+    # ------------------------------------------------------------------ #
+    #  Step 1: collect canonical pattern stats                             #
+    # ------------------------------------------------------------------ #
+    patterns_arr, counts_arr, pixel_means = _collect_pattern_stats(frame_tiles, palette)
+    counts_arr = counts_arr.astype(np.float64)
+
+    if len(patterns_arr) == 0:
+        return np.zeros((n_medoids, 8), dtype=np.uint8)
+
+    n_unique = len(patterns_arr)
+    cluster_target = min(n_unique, n_medoids)
+    if cluster_target < n_medoids:
+        pad_count = n_medoids - len(patterns_arr)
+        out = np.vstack([patterns_arr,
+                         np.zeros((pad_count, 8), dtype=np.uint8)]) if pad_count > 0 else patterns_arr.copy()
+        _ensure_zero_medoid(out)
+        return out
+
+    # ------------------------------------------------------------------ #
+    #  Step 2: build perceptual + structural features                      #
+    # ------------------------------------------------------------------ #
+    palette_oklab = rgb_to_oklab(palette.astype(np.float32))
+    pixel_means_oklab = rgb_to_oklab(pixel_means.reshape(-1, 3)).reshape(n_unique, 64, 3)
+
+    fg_palette_oklab = (rgb_to_oklab(fg_palette.astype(np.float32))
+                        if fg_palette is not None else None)
+    bg_palette_oklab = (rgb_to_oklab(bg_palette.astype(np.float32))
+                        if bg_palette is not None else None)
+
+    # Precompute palette squared-norms once; passed to every cost column call
+    _pal_fg = fg_palette_oklab if fg_palette_oklab is not None else palette_oklab
+    _pal_bg = bg_palette_oklab if bg_palette_oklab is not None else palette_oklab
+    fg_pal_norms = (_pal_fg * _pal_fg).sum(axis=1)
+    bg_pal_norms = (_pal_bg * _pal_bg).sum(axis=1)
+
+    raw_bytes = patterns_arr.astype(np.float32)
+    raw_n = ((raw_bytes - raw_bytes.mean(axis=0))
+             / (raw_bytes.std(axis=0) + 1e-6))
+    font_features = _build_perceptual_cluster_features(
+        pixel_means_oklab, struct_feats=raw_n, perceptual_weight=8.0)
+
+    rng = np.random.RandomState(seed)
+
+    # Evaluation indices (frequency-weighted sampling for fair global assessment)
+    if eval_size >= n_unique:
+        eval_idxs = np.arange(n_unique)
+    else:
+        probs = counts_arr / counts_arr.sum()
+        eval_idxs = rng.choice(n_unique, size=min(eval_size, n_unique),
+                               replace=False, p=probs)
+
+    best_cost = float('inf')
+    best_medoids_idx = None
+
+    # ------------------------------------------------------------------ #
+    #  Step 3: CLARA subsample runs                                        #
+    # ------------------------------------------------------------------ #
+    for r in range(max(1, subsamples)):
+        sample_size = min(subsample_size, n_unique)
+        if sample_size <= cluster_target:
+            subsample_idxs = np.arange(n_unique)
+        else:
+            probs = counts_arr / counts_arr.sum()
+            subsample_idxs = rng.choice(n_unique, size=sample_size,
+                                        replace=False, p=probs)
+
+        sample_feats = font_features[subsample_idxs]
+        sample_counts = counts_arr[subsample_idxs].astype(np.float32)
+
+        kmeans = make_kmeans(n_clusters=cluster_target, random_state=seed + r, n_init=10)
+        try:
+            kmeans.fit(sample_feats, sample_weight=sample_counts)
+        except TypeError:
+            kmeans.fit(sample_feats)
+
+        labels_r = kmeans.labels_
+        try:
+            centers_r = kmeans.cluster_centers_
+        except Exception:
+            centers_r = np.array([
+                sample_feats[labels_r == k].mean(axis=0) if np.any(labels_r == k) else sample_feats[0]
+                for k in range(cluster_target)
+            ])
+
+        # Per-cluster candidate evaluation; track running cost to compare subsample runs
+        medoid_idxs = []
+        total_cost_r = 0.0
+        for k in range(cluster_target):
+            mem_local = np.where(labels_r == k)[0]
+            if len(mem_local) == 0:
+                medoid_idxs.append(int(subsample_idxs[0]))
+                continue
+            mem_global = subsample_idxs[mem_local]
+
+            cand_set = set()
+            # Top-K centroid neighbours
+            fdists = np.linalg.norm(sample_feats[mem_local] - centers_r[k], axis=1)
+            order = np.argsort(fdists)
+            for ri in order[:max(1, min(candidates, len(order)))]:
+                cand_set.add(int(mem_global[ri]))
+            # Hamming medoid
+            bitmats_k = np.array([_pattern_bytes_to_mask(patterns_arr[gi]).astype(np.uint8)
+                                   for gi in mem_global])
+            sums_k = bitmats_k.sum(axis=1).astype(np.int32)
+            overlap_k = bitmats_k.dot(bitmats_k.T)
+            ham_total = (sums_k[:, None] + sums_k[None, :] - 2 * overlap_k).sum(axis=1)
+            cand_set.add(int(mem_global[int(np.argmin(ham_total))]))
+
+            member_px = pixel_means_oklab[mem_global]
+            member_w = counts_arr[mem_global].astype(np.float32)
+
+            best_local = float('inf')
+            best_local_idx = int(mem_global[0])
+            for ci in cand_set:
+                cost = _oklab_score_candidate(
+                    patterns_arr[ci], member_px, member_w,
+                    palette_oklab, fg_palette_oklab, bg_palette_oklab)
+                if cost < best_local:
+                    best_local = cost
+                    best_local_idx = ci
+            medoid_idxs.append(best_local_idx)
+            total_cost_r += best_local  # accumulate per-cluster cost for subsample comparison
+
+        medoid_idxs = np.array(medoid_idxs, dtype=int)
+        # Use accumulated per-cluster cost to select best subsample (avoids expensive global scoring)
+        if total_cost_r < best_cost:
+            best_cost = total_cost_r
+            best_medoids_idx = medoid_idxs.copy()
+
+    if best_medoids_idx is None:
+        return derive_medoids_oklab_kmeans(frame_tiles, n_medoids, palette,
+                                           candidates=candidates,
+                                           fg_palette=fg_palette, bg_palette=bg_palette)
+
+    # ------------------------------------------------------------------ #
+    #  Step 4: efficient delta-cost PAM refinement                         #
+    # ------------------------------------------------------------------ #
+    medoid_set = best_medoids_idx.copy()
+
+    if pam_budget > 0:
+        n_eval = len(eval_idxs)
+        eval_px = pixel_means_oklab[eval_idxs]   # (n_eval, 64, 3)
+        eval_w = counts_arr[eval_idxs]            # (n_eval,)
+        k = len(medoid_set)
+
+        # Build full cost matrix once with batched vectorised approach
+        cost_matrix = _build_cost_matrix_batched(
+            patterns_arr[medoid_set], eval_px,
+            _pal_fg, _pal_bg,
+            fg_pal_norms, bg_pal_norms)
+
+        # Per-pattern top-2 assignments (needed for O(n_eval) delta computation)
+        sorted2 = np.argsort(cost_matrix, axis=1)[:, :2]   # (n_eval, 2)
+        assign_j = sorted2[:, 0]
+        second_j = sorted2[:, 1]
+        best_costs = cost_matrix[np.arange(n_eval), assign_j]
+
+        # Non-medoids sorted by occurrence count descending (try common patterns first)
+        non_medoid_arr = np.setdiff1d(np.arange(n_unique), medoid_set)
+        nm_order = non_medoid_arr[np.argsort(-counts_arr[non_medoid_arr])]
+
+        trials = 0
+        no_improve_sweeps = 0
+        while trials < pam_budget and len(nm_order) > 0 and no_improve_sweeps < 3:
+            improved_this_sweep = False
+
+            for j in range(k):
+                if trials >= pam_budget:
+                    break
+
+                # Cluster members currently assigned to medoid j
+                assigned_j_mask = (assign_j == j)
+                second_cost_for_j = cost_matrix[np.arange(n_eval), second_j]
+
+                # Budget per medoid slot: share remaining budget
+                slots_left = k - j
+                nm_try = nm_order[:max(5, (pam_budget - trials) // max(1, slots_left))]
+                n_cands = min(len(nm_try), pam_budget - trials)
+                if n_cands <= 0:
+                    break
+                nm_batch = nm_try[:n_cands]
+                trials += n_cands
+
+                # Batch-compute cost columns for all candidates at once
+                batch_costs = _build_cost_matrix_batched(
+                    patterns_arr[nm_batch], eval_px,
+                    _pal_fg, _pal_bg, fg_pal_norms, bg_pal_norms)
+                # batch_costs: (n_eval, n_cands)
+
+                # Vectorised delta-cost over all candidates simultaneously
+                new_cost_all = np.where(
+                    assigned_j_mask[:, None],
+                    np.minimum(batch_costs, second_cost_for_j[:, None]),
+                    np.minimum(best_costs[:, None], batch_costs))
+                # new_cost_all: (n_eval, n_cands)
+                new_totals = (new_cost_all * eval_w[:, None]).sum(axis=0)  # (n_cands,)
+                old_total = float((best_costs * eval_w).sum())
+
+                best_nc = int(np.argmin(new_totals))
+                if new_totals[best_nc] < old_total - 1e-12:
+                    nm = nm_batch[best_nc]
+                    cost_c = batch_costs[:, best_nc]
+                    # Accept swap: update medoid_set, cost_matrix, tracking arrays
+                    old_m = medoid_set[j]
+                    medoid_set[j] = nm
+                    cost_matrix[:, j] = cost_c
+                    nm_order = np.concatenate([nm_order[nm_order != nm], [old_m]])
+                    nm_order = nm_order[np.argsort(-counts_arr[nm_order])]
+                    sorted2 = np.argsort(cost_matrix, axis=1)[:, :2]
+                    assign_j = sorted2[:, 0]
+                    second_j = sorted2[:, 1]
+                    best_costs = cost_matrix[np.arange(n_eval), assign_j]
+                    improved_this_sweep = True
+
+            if not improved_this_sweep:
+                no_improve_sweeps += 1
+            else:
+                no_improve_sweeps = 0
+
+    # ------------------------------------------------------------------ #
+    #  Step 5: assemble result                                             #
+    # ------------------------------------------------------------------ #
+    final_medoids = patterns_arr[medoid_set]
+    if len(final_medoids) < n_medoids:
+        pad = np.zeros((n_medoids - len(final_medoids), 8), dtype=np.uint8)
+        final_medoids = np.vstack([final_medoids, pad])
+    elif len(final_medoids) > n_medoids:
+        final_medoids = final_medoids[:n_medoids]
+
+    _ensure_zero_medoid(final_medoids)
+    return final_medoids
+
 
 
 def compute_coherence_medoids(all_frame_canonical_sets, n_coherence):
@@ -1258,7 +2355,7 @@ def _build_numba_hq_kernel():
             lum_sorted = np.sort(lum)
             threshold = 0.5 * (lum_sorted[31] + lum_sorted[32])
 
-            # FG / BG centres
+            # FG / BG centers
             fg_sum_r = np.float32(0.0); fg_sum_g = np.float32(0.0); fg_sum_b = np.float32(0.0)
             bg_sum_r = np.float32(0.0); bg_sum_g = np.float32(0.0); bg_sum_b = np.float32(0.0)
             fg_count = 0; bg_count = 0
@@ -1415,7 +2512,222 @@ def _build_numba_hq_kernel():
 _numba_hq_kernel = None
 
 
-def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_quality=False, bg_palette=None):
+def _build_numba_hq_kernel_4lut():
+    """Build and return the Numba-JIT compiled _hq_assign_tiles_4lut function.
+
+    Uses a merged-pool top-K strategy: all valid FG entries from both LUTs are
+    pooled together (510 entries) and the K globally-best candidates are selected
+    using perceptual (BT.601) weighted distance.  This eliminates the per-LUT K
+    restriction of the previous approach, ensuring optimal candidates are found
+    regardless of which LUT they belong to.  Final SSE scoring is unweighted RGB
+    for consistency with compare_frames.py.
+
+    Signature of returned function:
+        _hq_assign_tiles_4lut(all_pixels, fg_merged, fg_lut_tags,
+                              bg_merged, bg_lut_tags, medoid_bits_f, K)
+    where
+        all_pixels:   (n_tiles, 64, 3) float32
+        fg_merged:    (N_fg, 3) float32  — FG0[1:] stacked with FG1[1:]
+        fg_lut_tags:  (N_fg,) int32      — 0 for LUT0 entries, 1 for LUT1 entries
+        bg_merged:    (N_bg, 3) float32
+        bg_lut_tags:  (N_bg,) int32
+        medoid_bits_f:(n_medoids, 64) float32
+        K:            int — candidates to keep from each merged pool
+
+    Returns (n_tiles, 7) int32:
+        [best_medoid, fg_pal_idx, bg_pal_idx, invert, is_flat, fg_lut_bit, bg_lut_bit]
+        fg_pal_idx / bg_pal_idx are 1-based indices into their respective LUT palettes.
+    """
+    @numba.njit(cache=True, parallel=True)
+    def _hq_assign_tiles_4lut(all_pixels, fg_merged, fg_lut_tags, bg_merged, bg_lut_tags, medoid_bits_f, K):
+        # --- Perceptual (BT.601) weights used in the top-K prefilter distance ---
+        WR = np.float32(0.299)
+        WG = np.float32(0.587)
+        WB = np.float32(0.114)
+
+        n_tiles       = all_pixels.shape[0]
+        n_fg_merged   = fg_merged.shape[0]
+        n_bg_merged   = bg_merged.shape[0]
+        n_medoids     = medoid_bits_f.shape[0]
+        results = np.empty((n_tiles, 7), dtype=np.int32)
+
+        for i in numba.prange(n_tiles):
+            orig = all_pixels[i]   # (64, 3)
+
+            # ---- luminance split (BT.601, consistent with prefilter) -------
+            lum = np.empty(64, dtype=np.float32)
+            for p in range(64):
+                lum[p] = WR * orig[p, 0] + WG * orig[p, 1] + WB * orig[p, 2]
+            lum_sorted = np.sort(lum)
+            threshold = np.float32(0.5) * (lum_sorted[31] + lum_sorted[32])
+
+            fg_sum_r = np.float32(0.); fg_sum_g = np.float32(0.); fg_sum_b = np.float32(0.)
+            bg_sum_r = np.float32(0.); bg_sum_g = np.float32(0.); bg_sum_b = np.float32(0.)
+            fg_count = np.int32(0); bg_count = np.int32(0)
+
+            is_flat = True
+            ref_r = orig[0, 0]; ref_g = orig[0, 1]; ref_b = orig[0, 2]
+            for p in range(64):
+                if p > 0 and (orig[p, 0] != ref_r or orig[p, 1] != ref_g or orig[p, 2] != ref_b):
+                    is_flat = False
+                if lum[p] >= threshold:
+                    fg_count += 1
+                    fg_sum_r += orig[p, 0]; fg_sum_g += orig[p, 1]; fg_sum_b += orig[p, 2]
+                else:
+                    bg_count += 1
+                    bg_sum_r += orig[p, 0]; bg_sum_g += orig[p, 1]; bg_sum_b += orig[p, 2]
+
+            if is_flat:
+                avg_r = orig[0, 0]; avg_g = orig[0, 1]; avg_b = orig[0, 2]
+                best_c = np.int32(0); best_d = np.float32(1e30); best_lut = np.int32(0)
+                # search merged BG pool (perceptual distance)
+                for ci in range(n_bg_merged):
+                    dr = bg_merged[ci, 0] - avg_r
+                    dg = bg_merged[ci, 1] - avg_g
+                    db = bg_merged[ci, 2] - avg_b
+                    d = WR*dr*dr + WG*dg*dg + WB*db*db
+                    if d < best_d:
+                        best_d = d; best_c = ci; best_lut = bg_lut_tags[ci]
+                # Map merged index → 1-based palette index
+                # Layout: merged[0..254]=LUT0[1..255], merged[255..509]=LUT1[1..255]
+                if best_lut == 0:
+                    pal_idx = best_c + 1
+                else:
+                    pal_idx = best_c - 254
+                results[i, 0] = 0; results[i, 1] = pal_idx; results[i, 2] = pal_idx
+                results[i, 3] = 0; results[i, 4] = 1; results[i, 5] = best_lut; results[i, 6] = best_lut
+                continue
+
+            fc_n = max(fg_count, np.int32(1))
+            bc_n = max(bg_count, np.int32(1))
+            fg_cr = fg_sum_r / fc_n; fg_cg = fg_sum_g / fc_n; fg_cb = fg_sum_b / fc_n
+            bg_cr = bg_sum_r / bc_n; bg_cg = bg_sum_g / bc_n; bg_cb = bg_sum_b / bc_n
+
+            # ---- Top-K from merged FG pool (perceptual distance) -----
+            fg_top_idx = np.empty(K, dtype=np.int32)
+            fg_top_d   = np.empty(K, dtype=np.float32)
+            for k in range(K):
+                fg_top_idx[k] = np.int32(-1); fg_top_d[k] = np.float32(1e30)
+
+            for ci in range(n_fg_merged):
+                dr = fg_merged[ci, 0] - fg_cr
+                dg = fg_merged[ci, 1] - fg_cg
+                db = fg_merged[ci, 2] - fg_cb
+                d = WR*dr*dr + WG*dg*dg + WB*db*db
+                if d < fg_top_d[K - 1]:
+                    fg_top_d[K - 1] = d; fg_top_idx[K - 1] = ci
+                    for s in range(K - 1, 0, -1):
+                        if fg_top_d[s] < fg_top_d[s - 1]:
+                            fg_top_d[s], fg_top_d[s - 1] = fg_top_d[s - 1], fg_top_d[s]
+                            fg_top_idx[s], fg_top_idx[s - 1] = fg_top_idx[s - 1], fg_top_idx[s]
+                        else:
+                            break
+
+            # ---- Top-K from merged BG pool (perceptual distance) -----
+            bg_top_idx = np.empty(K, dtype=np.int32)
+            bg_top_d   = np.empty(K, dtype=np.float32)
+            for k in range(K):
+                bg_top_idx[k] = np.int32(-1); bg_top_d[k] = np.float32(1e30)
+
+            for ci in range(n_bg_merged):
+                dr = bg_merged[ci, 0] - bg_cr
+                dg = bg_merged[ci, 1] - bg_cg
+                db = bg_merged[ci, 2] - bg_cb
+                d = WR*dr*dr + WG*dg*dg + WB*db*db
+                if d < bg_top_d[K - 1]:
+                    bg_top_d[K - 1] = d; bg_top_idx[K - 1] = ci
+                    for s in range(K - 1, 0, -1):
+                        if bg_top_d[s] < bg_top_d[s - 1]:
+                            bg_top_d[s], bg_top_d[s - 1] = bg_top_d[s - 1], bg_top_d[s]
+                            bg_top_idx[s], bg_top_idx[s - 1] = bg_top_idx[s - 1], bg_top_idx[s]
+                        else:
+                            break
+
+            # ---- SSE search over K×K pairs × n_medoids (unweighted for consistency) ----
+            best_sse  = np.float32(1e30)
+            best_m    = np.int32(0)
+            best_fc   = np.int32(1); best_fl = np.int32(0)
+            best_bc   = np.int32(1); best_bl = np.int32(0)
+            best_inv  = np.int32(0)
+
+            gain   = np.empty(64, dtype=np.float32)
+            gain_i = np.empty(64, dtype=np.float32)
+
+            for ki in range(K):
+                fci = fg_top_idx[ki]
+                if fci < 0:
+                    continue
+                fgr = fg_merged[fci, 0]; fgg = fg_merged[fci, 1]; fgb = fg_merged[fci, 2]
+                fl = fg_lut_tags[fci]
+                if fl == 0:
+                    fc_pal_idx = fci + 1
+                else:
+                    fc_pal_idx = fci - 254  # merged[255..509] → pal[1..255]
+
+                for kj in range(K):
+                    bci = bg_top_idx[kj]
+                    if bci < 0:
+                        continue
+                    bgr = bg_merged[bci, 0]; bgg = bg_merged[bci, 1]; bgb = bg_merged[bci, 2]
+                    bl = bg_lut_tags[bci]
+                    if bl == 0:
+                        bc_pal_idx = bci + 1
+                    else:
+                        bc_pal_idx = bci - 254
+
+                    if fgr == bgr and fgg == bgg and fgb == bgb:
+                        continue
+
+                    diff_r = fgr - bgr; diff_g = fgg - bgg; diff_b = fgb - bgb
+                    diff_sq = diff_r*diff_r + diff_g*diff_g + diff_b*diff_b
+
+                    base   = np.float32(0.)
+                    base_i = np.float32(0.)
+                    for p in range(64):
+                        er = bgr - orig[p, 0]; eg = bgg - orig[p, 1]; eb = bgb - orig[p, 2]
+                        e_dot_d = er*diff_r + eg*diff_g + eb*diff_b
+                        base += er*er + eg*eg + eb*eb
+                        gain[p] = np.float32(2.) * e_dot_d + diff_sq
+
+                        eir = fgr - orig[p, 0]; eig = fgg - orig[p, 1]; eib = fgb - orig[p, 2]
+                        ei_dot_d = eir*diff_r + eig*diff_g + eib*diff_b
+                        base_i += eir*eir + eig*eig + eib*eib
+                        gain_i[p] = np.float32(-2.) * ei_dot_d + diff_sq
+
+                    for m in range(n_medoids):
+                        sse_n = base; sse_v = base_i
+                        for p in range(64):
+                            bit = medoid_bits_f[m, p]
+                            sse_n += bit * gain[p]
+                            sse_v += bit * gain_i[p]
+                        if sse_n < best_sse:
+                            best_sse = sse_n; best_m = m
+                            best_fc = fc_pal_idx; best_bc = bc_pal_idx
+                            best_inv = np.int32(0); best_fl = fl; best_bl = bl
+                        if sse_v < best_sse:
+                            best_sse = sse_v; best_m = m
+                            best_fc = fc_pal_idx; best_bc = bc_pal_idx
+                            best_inv = np.int32(1); best_fl = fl; best_bl = bl
+
+            results[i, 0] = best_m
+            results[i, 1] = best_fc
+            results[i, 2] = best_bc
+            results[i, 3] = best_inv
+            results[i, 4] = 0  # not flat
+            results[i, 5] = best_fl
+            results[i, 6] = best_bl
+
+        return results
+
+    return _hq_assign_tiles_4lut
+
+
+# Lazily compiled handles — filled on first use.
+_numba_hq_kernel_4lut = None
+
+
+def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_quality=False, bg_palette=None,
+                            four_color_luts=False, fg_lut_palettes=None, bg_lut_palettes=None):
     """Assign each tile to best medoid/font-set and FG/BG indices.
 
     Default: Hamming-distance matching with luminance-based FG/BG split.
@@ -1434,7 +2746,7 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
         bg_palette: (256, 3) uint8 RGB palette for background.
                     If None, uses palette for both FG and BG (shared mode).
     """
-    global _numba_hq_kernel
+    global _numba_hq_kernel, _numba_hq_kernel_4lut
 
     if bg_palette is None:
         bg_palette = palette
@@ -1443,7 +2755,10 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
     n_tiles = len(frame_tiles)
     n_font_sets = max(1, n_medoids // 256)
 
-    tile_assignments = np.zeros((n_tiles, 5), dtype=np.uint16)
+    if four_color_luts:
+        tile_assignments = np.zeros((n_tiles, 7), dtype=np.uint16)
+    else:
+        tile_assignments = np.zeros((n_tiles, 5), dtype=np.uint16)
 
     # Precompute medoid bit patterns: (n_medoids, 64)
     medoid_bits = np.zeros((n_medoids, 64), dtype=np.uint8)
@@ -1454,14 +2769,34 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
             for c in range(8):
                 medoid_bits[m_idx, r * 8 + c] = (byte >> (7 - c)) & 1
 
-    fg_palette_f = palette.astype(np.float32)
-    bg_palette_f = bg_palette.astype(np.float32)
+    # Prepare palette float buffers. When four_color_luts is enabled we expect
+    # fg_lut_palettes and bg_lut_palettes to be lists of two (256,3) arrays.
+    if four_color_luts:
+        if fg_lut_palettes is None or bg_lut_palettes is None:
+            raise ValueError('four_color_luts=True but fg_lut_palettes/bg_lut_palettes not provided')
+        fg0_f = np.array(fg_lut_palettes[0], dtype=np.float32)
+        fg1_f = np.array(fg_lut_palettes[1], dtype=np.float32)
+        bg0_f = np.array(bg_lut_palettes[0], dtype=np.float32)
+        bg1_f = np.array(bg_lut_palettes[1], dtype=np.float32)
+        # Build merged pools for the Numba 4-LUT kernel (skip index 0 = transparent).
+        # Layout: merged[0..254] = LUT0[1..255], merged[255..509] = LUT1[1..255].
+        fg_merged = np.vstack([fg0_f[1:], fg1_f[1:]])     # (510, 3) float32
+        fg_lut_tags = np.zeros(510, dtype=np.int32)
+        fg_lut_tags[255:] = 1
+        bg_merged = np.vstack([bg0_f[1:], bg1_f[1:]])     # (510, 3) float32
+        bg_lut_tags = np.zeros(510, dtype=np.int32)
+        bg_lut_tags[255:] = 1
+    else:
+        fg_palette_f = palette.astype(np.float32)
+        bg_palette_f = bg_palette.astype(np.float32)
     medoid_bits_f = medoid_bits.astype(np.float32)  # (n_medoids, 64)
 
-    K = 3  # top-K palette candidates when high_quality is on
+    K = 3       # top-K palette candidates for the 2-LUT high-quality kernel
+    K_4lut = 6  # top-K for 4-LUT merged-pool search (6×6=36 pairs, matching 2-LUT compute budget)
 
     # ----- Numba fast-path for high_quality --------------------------------
-    if high_quality and _USE_NUMBA:
+    # NOTE: numba kernel does not support multi-LUT (four_color_luts) mode.
+    if high_quality and _USE_NUMBA and not four_color_luts:
         # Pack all tile pixels into a contiguous (n_tiles, 64, 3) float32 array
         all_pixels = np.empty((n_tiles, 64, 3), dtype=np.float32)
         for i, tile in enumerate(frame_tiles):
@@ -1494,6 +2829,40 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
 
         return tile_assignments
 
+    # ----- Numba fast-path for high_quality + four_color_luts ---------------
+    if high_quality and _USE_NUMBA and four_color_luts:
+        all_pixels = np.empty((n_tiles, 64, 3), dtype=np.float32)
+        for i, tile in enumerate(frame_tiles):
+            all_pixels[i] = tile['pixels'].reshape(64, 3).astype(np.float32)
+
+        if _numba_hq_kernel_4lut is None:
+            print("  [numba] JIT-compiling 4-LUT high-quality kernel (first call only)...")
+            _numba_hq_kernel_4lut = _build_numba_hq_kernel_4lut()
+
+        # hq4_results: (n_tiles, 7) int32
+        # cols: [best_medoid, fg_idx, bg_idx, invert, is_flat, fg_lut_bit, bg_lut_bit]
+        hq4_results = _numba_hq_kernel_4lut(all_pixels, fg_merged, fg_lut_tags, bg_merged, bg_lut_tags, medoid_bits_f, K_4lut)
+
+        for i in range(n_tiles):
+            best_medoid = int(hq4_results[i, 0])
+            fg_idx      = int(hq4_results[i, 1])
+            bg_idx      = int(hq4_results[i, 2])
+            best_invert = int(hq4_results[i, 3])
+            is_flat     = int(hq4_results[i, 4])
+            fg_lut_bit  = int(hq4_results[i, 5])
+            bg_lut_bit  = int(hq4_results[i, 6])
+
+            if is_flat:
+                tile_assignments[i] = [0, 0, fg_idx, bg_idx, 0, fg_lut_bit, bg_lut_bit]
+            else:
+                fs = best_medoid // 256
+                if fs >= n_font_sets:
+                    fs = n_font_sets - 1
+                char_idx = best_medoid % 256
+                tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert, fg_lut_bit, bg_lut_bit]
+
+        return tile_assignments
+
     # ----- Scalar (non-Numba) path -----------------------------------------
     for i, tile in enumerate(frame_tiles):
         orig_rgb = tile['pixels'].reshape(-1, 3).astype(np.float32)  # (64, 3)
@@ -1501,10 +2870,26 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
         unique_colors = np.unique(orig_rgb, axis=0)
         if len(unique_colors) < 2:
             avg = orig_rgb.mean(axis=0)
-            dists = np.linalg.norm(bg_palette_f - avg, axis=1)
-            dists[0] = float('inf')
-            best_color = int(np.argmin(dists))
-            tile_assignments[i] = [0, 0, best_color, best_color, 0]
+            if four_color_luts:
+                d0 = np.linalg.norm(bg0_f - avg, axis=1)
+                d1 = np.linalg.norm(bg1_f - avg, axis=1)
+                d0[0] = float('inf')
+                d1[0] = float('inf')
+                i0 = int(np.argmin(d0))
+                i1 = int(np.argmin(d1))
+                if d0[i0] <= d1[i1]:
+                    best_color = i0
+                    best_bg_lut = 0
+                else:
+                    best_color = i1
+                    best_bg_lut = 1
+                # For flat tiles choose same LUT for FG/BG
+                tile_assignments[i] = [0, 0, best_color, best_color, 0, best_bg_lut, best_bg_lut]
+            else:
+                dists = np.linalg.norm(bg_palette_f - avg, axis=1)
+                dists[0] = float('inf')
+                best_color = int(np.argmin(dists))
+                tile_assignments[i] = [0, 0, best_color, best_color, 0]
             continue
 
         # Luminance-based FG/BG split
@@ -1521,120 +2906,220 @@ def assign_tiles_to_medoids(frame_tiles, palette, clustered_medoids, high_qualit
             # Uses an algebraic expansion of per-pixel SSE so that the inner
             # loop is a single (n_medoids, 64) @ (64,) matrix-vector product
             # per (fg, bg, inversion) candidate — very fast.
-            fg_dists_all = np.linalg.norm(fg_palette_f - fg_center, axis=1)
-            fg_dists_all[0] = float('inf')
-            fg_candidates = np.argpartition(fg_dists_all, K)[:K]
-
-            bg_dists_all = np.linalg.norm(bg_palette_f - bg_center, axis=1)
-            bg_dists_all[0] = float('inf')
-            bg_candidates = np.argpartition(bg_dists_all, K)[:K]
-
+            # For four-color-luts evaluate FG0/1 x BG0/1 combinations; otherwise
+            # run the single-palette search as before.
             best_sse = float('inf')
-            best_result = (0, int(fg_candidates[0]), int(bg_candidates[0]), 0)
+            best_result = (0, 0, 0, 0, 0, 0)
 
-            for fc in fg_candidates:
-                fg_color = fg_palette_f[fc]  # (3,)
-                for bc in bg_candidates:
-                    bg_color = bg_palette_f[bc]  # (3,)
-                    # Skip if colors are identical (flat)
-                    if np.allclose(fg_color, bg_color):
-                        continue
-                    diff = fg_color - bg_color  # (3,)
-                    diff_sq = float(np.dot(diff, diff))
+            def eval_candidates(fg_pal_f, bg_pal_f, fg_lut_bit, bg_lut_bit):
+                nonlocal best_sse, best_result
+                fg_dists_all = np.linalg.norm(fg_pal_f - fg_center, axis=1)
+                fg_dists_all[0] = float('inf')
+                fg_candidates = np.argpartition(fg_dists_all, K)[:K]
 
-                    # Normal pattern: recon_p = bg + bit_p * diff
-                    # SSE[m] = base + medoid_bits[m] · gain
-                    e = bg_color - orig_rgb          # (64, 3)
-                    e_dot_d = (e * diff).sum(axis=1) # (64,)
-                    base = float((e * e).sum())
-                    gain = 2.0 * e_dot_d + diff_sq   # (64,)
-                    sse_normal = base + medoid_bits_f @ gain  # (n_medoids,)
+                bg_dists_all = np.linalg.norm(bg_pal_f - bg_center, axis=1)
+                bg_dists_all[0] = float('inf')
+                bg_candidates = np.argpartition(bg_dists_all, K)[:K]
 
-                    mn = int(np.argmin(sse_normal))
-                    if sse_normal[mn] < best_sse:
-                        best_sse = float(sse_normal[mn])
-                        best_result = (mn, int(fc), int(bc), 0)
+                for fc in fg_candidates:
+                    fg_color = fg_pal_f[fc]
+                    for bc in bg_candidates:
+                        bg_color = bg_pal_f[bc]
+                        if np.allclose(fg_color, bg_color):
+                            continue
+                        diff = fg_color - bg_color
+                        diff_sq = float(np.dot(diff, diff))
 
-                    # Inverted pattern: recon_p = fg - bit_p * diff
-                    ei = fg_color - orig_rgb             # (64, 3)
-                    ei_dot_d = (ei * diff).sum(axis=1)   # (64,)
-                    base_i = float((ei * ei).sum())
-                    gain_i = -2.0 * ei_dot_d + diff_sq   # (64,)
-                    sse_inv = base_i + medoid_bits_f @ gain_i  # (n_medoids,)
+                        e = bg_color - orig_rgb
+                        e_dot_d = (e * diff).sum(axis=1)
+                        base = float((e * e).sum())
+                        gain = 2.0 * e_dot_d + diff_sq
+                        sse_normal = base + medoid_bits_f @ gain
+                        mn = int(np.argmin(sse_normal))
+                        if sse_normal[mn] < best_sse:
+                            best_sse = float(sse_normal[mn])
+                            best_result = (mn, int(fc), int(bc), 0, fg_lut_bit, bg_lut_bit)
 
-                    mi = int(np.argmin(sse_inv))
-                    if sse_inv[mi] < best_sse:
-                        best_sse = float(sse_inv[mi])
-                        best_result = (mi, int(fc), int(bc), 1)
+                        ei = fg_color - orig_rgb
+                        ei_dot_d = (ei * diff).sum(axis=1)
+                        base_i = float((ei * ei).sum())
+                        gain_i = -2.0 * ei_dot_d + diff_sq
+                        sse_inv = base_i + medoid_bits_f @ gain_i
+                        mi = int(np.argmin(sse_inv))
+                        if sse_inv[mi] < best_sse:
+                            best_sse = float(sse_inv[mi])
+                            best_result = (mi, int(fc), int(bc), 1, fg_lut_bit, bg_lut_bit)
 
-            best_medoid, fg_idx, bg_idx, best_invert = best_result
+            if four_color_luts:
+                eval_candidates(fg0_f, bg0_f, 0, 0)
+                eval_candidates(fg0_f, bg1_f, 0, 1)
+                eval_candidates(fg1_f, bg0_f, 1, 0)
+                eval_candidates(fg1_f, bg1_f, 1, 1)
+            else:
+                eval_candidates(fg_palette_f, bg_palette_f, 0, 0)
+
+            best_medoid, fg_idx, bg_idx, best_invert, best_fg_lut, best_bg_lut = best_result
 
         else:
             # --- Legacy Hamming-distance matching ---
-            fg_dists = np.linalg.norm(fg_palette_f - fg_center, axis=1)
-            fg_dists[0] = float('inf')
-            fg_idx = int(np.argmin(fg_dists))
+            if four_color_luts:
+                # Find best FG across both FG palettes
+                fg_d0 = np.linalg.norm(fg0_f - fg_center, axis=1)
+                fg_d0[0] = float('inf')
+                fg_d1 = np.linalg.norm(fg1_f - fg_center, axis=1)
+                fg_d1[0] = float('inf')
+                fg_idx0 = int(np.argmin(fg_d0))
+                fg_idx1 = int(np.argmin(fg_d1))
+                if fg_d0[fg_idx0] <= fg_d1[fg_idx1]:
+                    fg_idx = fg_idx0
+                    fg_lut_bit = 0
+                else:
+                    fg_idx = fg_idx1
+                    fg_lut_bit = 1
 
-            bg_dists = np.linalg.norm(bg_palette_f - bg_center, axis=1)
-            bg_idx = int(np.argmin(bg_dists))
+                # Best BG across both BG palettes
+                bg_d0 = np.linalg.norm(bg0_f - bg_center, axis=1)
+                bg_d0[0] = float('inf')
+                bg_d1 = np.linalg.norm(bg1_f - bg_center, axis=1)
+                bg_d1[0] = float('inf')
+                bg_idx0 = int(np.argmin(bg_d0))
+                bg_idx1 = int(np.argmin(bg_d1))
+                if bg_d0[bg_idx0] <= bg_d1[bg_idx1]:
+                    bg_idx = bg_idx0
+                    bg_lut_bit = 0
+                else:
+                    bg_idx = bg_idx1
+                    bg_lut_bit = 1
 
-            # When palettes are separate, indices refer to different LUTs
-            # so numerical equality is not meaningful; compare actual colors.
-            if np.allclose(fg_palette_f[fg_idx], bg_palette_f[bg_idx]):
-                bg_dists[bg_idx] = float('inf')
-                bg_idx = int(np.argmin(bg_dists))
+                # If chosen colors are numerically identical, prefer other BG candidate
+                fg_color = (fg0_f if fg_lut_bit == 0 else fg1_f)[fg_idx]
+                bg_color = (bg0_f if bg_lut_bit == 0 else bg1_f)[bg_idx]
+                if np.allclose(fg_color, bg_color):
+                    # try to pick alternative bg
+                    if bg_lut_bit == 0 and bg_d1[bg_idx1] < float('inf'):
+                        bg_idx = bg_idx1
+                        bg_lut_bit = 1
+                    elif bg_lut_bit == 1 and bg_d0[bg_idx0] < float('inf'):
+                        bg_idx = bg_idx0
+                        bg_lut_bit = 0
 
-            ideal_pattern = np.zeros(8, dtype=np.uint8)
-            for row in range(8):
-                byte = 0
-                for col in range(8):
-                    pixel_idx = row * 8 + col
-                    if fg_mask[pixel_idx]:
-                        byte |= (1 << (7 - col))
-                ideal_pattern[row] = byte
+                # Medoid selection (pattern only)
+                ideal_pattern = np.zeros(8, dtype=np.uint8)
+                for row in range(8):
+                    byte = 0
+                    for col in range(8):
+                        pixel_idx = row * 8 + col
+                        if fg_mask[pixel_idx]:
+                            byte |= (1 << (7 - col))
+                    ideal_pattern[row] = byte
 
-            ideal_bits = np.zeros(64, dtype=np.uint8)
-            for r in range(8):
-                byte = ideal_pattern[r]
-                for c in range(8):
-                    ideal_bits[r * 8 + c] = (byte >> (7 - c)) & 1
+                ideal_bits = np.zeros(64, dtype=np.uint8)
+                for r in range(8):
+                    byte = ideal_pattern[r]
+                    for c in range(8):
+                        ideal_bits[r * 8 + c] = (byte >> (7 - c)) & 1
 
-            xor_normal = np.bitwise_xor(medoid_bits, ideal_bits)
-            hamming_normal = np.sum(xor_normal.astype(np.float32), axis=1)
+                xor_normal = np.bitwise_xor(medoid_bits, ideal_bits)
+                hamming_normal = np.sum(xor_normal.astype(np.float32), axis=1)
 
-            ideal_bits_inv = 1 - ideal_bits
-            xor_inv = np.bitwise_xor(medoid_bits, ideal_bits_inv)
-            hamming_inv = np.sum(xor_inv.astype(np.float32), axis=1)
+                ideal_bits_inv = 1 - ideal_bits
+                xor_inv = np.bitwise_xor(medoid_bits, ideal_bits_inv)
+                hamming_inv = np.sum(xor_inv.astype(np.float32), axis=1)
 
-            best_normal_idx = int(np.argmin(hamming_normal))
-            best_inv_idx = int(np.argmin(hamming_inv))
+                best_normal_idx = int(np.argmin(hamming_normal))
+                best_inv_idx = int(np.argmin(hamming_inv))
 
-            if hamming_normal[best_normal_idx] <= hamming_inv[best_inv_idx]:
-                best_medoid = best_normal_idx
-                best_invert = 0
+                if hamming_normal[best_normal_idx] <= hamming_inv[best_inv_idx]:
+                    best_medoid = best_normal_idx
+                    best_invert = 0
+                else:
+                    best_medoid = best_inv_idx
+                    best_invert = 1
+
+                fs = best_medoid // 256
+                if fs >= n_font_sets:
+                    fs = n_font_sets - 1
+                char_idx = best_medoid % 256
+                tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert, fg_lut_bit, bg_lut_bit]
+                continue
             else:
-                best_medoid = best_inv_idx
-                best_invert = 1
+                # Legacy single-palette Hamming match (no four-color LUTs)
+                fg_d = np.linalg.norm(fg_palette_f - fg_center, axis=1)
+                fg_d[0] = float('inf')
+                fg_idx = int(np.argmin(fg_d))
+
+                bg_d = np.linalg.norm(bg_palette_f - bg_center, axis=1)
+                bg_d[0] = float('inf')
+                bg_idx = int(np.argmin(bg_d))
+
+                # Ensure distinct FG/BG
+                if fg_idx == bg_idx:
+                    bg_d[bg_idx] = float('inf')
+                    bg_idx = int(np.argmin(bg_d))
+
+                # Determine ideal pattern and choose best medoid (normal/inv)
+                ideal_pattern = np.zeros(8, dtype=np.uint8)
+                for row in range(8):
+                    byte = 0
+                    for col in range(8):
+                        pixel_idx = row * 8 + col
+                        if fg_mask[pixel_idx]:
+                            byte |= (1 << (7 - col))
+                    ideal_pattern[row] = byte
+
+                ideal_bits = np.zeros(64, dtype=np.uint8)
+                for r in range(8):
+                    byte = ideal_pattern[r]
+                    for c in range(8):
+                        ideal_bits[r * 8 + c] = (byte >> (7 - c)) & 1
+
+                xor_normal = np.bitwise_xor(medoid_bits, ideal_bits)
+                hamming_normal = np.sum(xor_normal.astype(np.float32), axis=1)
+
+                ideal_bits_inv = 1 - ideal_bits
+                xor_inv = np.bitwise_xor(medoid_bits, ideal_bits_inv)
+                hamming_inv = np.sum(xor_inv.astype(np.float32), axis=1)
+
+                best_normal_idx = int(np.argmin(hamming_normal))
+                best_inv_idx = int(np.argmin(hamming_inv))
+
+                if hamming_normal[best_normal_idx] <= hamming_inv[best_inv_idx]:
+                    best_medoid = best_normal_idx
+                    best_invert = 0
+                else:
+                    best_medoid = best_inv_idx
+                    best_invert = 1
+
+                fs = best_medoid // 256
+                if fs >= n_font_sets:
+                    fs = n_font_sets - 1
+                char_idx = best_medoid % 256
+                tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert]
+                continue
+        # End scalar loop
 
         fs = best_medoid // 256
         if fs >= n_font_sets:
             fs = n_font_sets - 1
         char_idx = best_medoid % 256
 
-        tile_assignments[i] = [fs, char_idx, fg_idx, bg_idx, best_invert]
+        if four_color_luts:
+            tile_assignments[i] = [fs, char_idx, int(fg_idx), int(bg_idx), int(best_invert), int(best_fg_lut), int(best_bg_lut)]
+        else:
+            tile_assignments[i] = [fs, char_idx, int(fg_idx), int(bg_idx), int(best_invert)]
 
     return tile_assignments
 
 
 def process_animation_frames_memtext_global(input_dir, high_quality=False, split_palette=False, denoise=0,
-                                             medoids_arr=None):
+                                             medoids_arr=None, four_color_luts=False):
     """Process animation frames in MEMTEXT mode.
     
     Key differences from regular animation mode:
-    - 256-color FG/BG palettes (identical, or split with --split-palette)
+    - 256-color FG/BG palettes (identical, split with --split-palette, or 4 sets of 256 for 4LUT mode)
     - 1024 medoids in 4 font sets of 256 each
     - Pattern inversion support to reduce unique patterns
-    - Tile data includes font_set (0-3), char_index (0-255), and invert bit
+    - Tile data includes font_set (0-3), char_index (0-255), lut_id, and invert bit
     
     Args:
         input_dir: Directory containing input frames
@@ -1644,6 +3129,7 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
         medoids_arr: optional np.array (1024, 8) uint8 — precomputed medoids loaded
             from a .npy file.  When provided, the per-animation clustering step is
             skipped and these medoids are used directly (after optional denoising).
+        four_color_luts: if True, create 4 separate palettes and evaluate all 4 LUT combinations.
     """
     # Find all image files
     image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.gif', '*.bmp', '*.tiff']
@@ -1660,12 +3146,28 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
     print(f"Found {len(image_files)} image files")
     
     # Step 1: Create palette(s)
-    if split_palette:
-        fg_palette, bg_palette = create_memtext_512_color_palette(image_files)
-        palette = fg_palette  # used as reference for medoid derivation
+    fg_palettes = None
+    bg_palettes = None
+    if four_color_luts:
+        fg_palettes, bg_palettes = create_memtext_4lut_palettes(image_files, split_palette=split_palette)
+        # Use first FG palette as reference for medoid derivation unless
+        # MEDOID_METHOD requests a merged/sample-aware palette.
+        if MEDOID_METHOD != 'legacy':
+            palette = merge_palettes_for_medoids(fg_palettes, bg_palettes)
+        else:
+            palette = fg_palettes[0]
+        fg_palette = fg_palettes[0]
+        bg_palette = bg_palettes[0]
     else:
-        palette = create_memtext_256_color_palette(image_files)
-        fg_palette = bg_palette = palette
+        if split_palette:
+            fg_palette, bg_palette = create_memtext_512_color_palette(image_files)
+            if MEDOID_METHOD != 'legacy':
+                palette = merge_palettes_for_medoids([fg_palette], [bg_palette])
+            else:
+                palette = fg_palette  # used as reference for medoid derivation
+        else:
+            palette = create_memtext_256_color_palette(image_files)
+            fg_palette = bg_palette = palette
     
     # Step 2: Load all frames and extract tiles
     print("Extracting 8x8 patterns from all frames...")
@@ -1691,7 +3193,18 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
             clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
     else:
         print("Clustering to 1024 medoids...")
-        clustered_medoids = derive_medoids_from_tiles(all_tiles, 1024, palette)
+        # For 4LUT + enhanced methods, score against all 4 palette LUTs combined
+        # (~510 FG colors and ~510 BG colors) so medoid selection sees the full
+        # 1024-color space rather than only the first 256-entry LUT.
+        if four_color_luts and fg_palettes is not None and MEDOID_METHOD != 'legacy':
+            _med_fg = np.concatenate([fg_palettes[0][1:], fg_palettes[1][1:]], axis=0)
+            _med_bg = np.concatenate([bg_palettes[0][1:], bg_palettes[1][1:]], axis=0)
+            print(f"  4LUT medoid scoring: {len(_med_fg)} FG + {len(_med_bg)} BG palette entries")
+        else:
+            _med_fg = fg_palette
+            _med_bg = bg_palette
+        clustered_medoids = derive_medoids_from_tiles(all_tiles, 1024, palette,
+            fg_palette=_med_fg, bg_palette=_med_bg)
         if denoise > 0:
             clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
     print(f"Using {len(clustered_medoids)} medoids")
@@ -1710,7 +3223,8 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
         frame_tiles = all_tiles[start:end]
         tile_assignments = assign_tiles_to_medoids(
             frame_tiles, fg_palette, clustered_medoids, high_quality=high_quality,
-            bg_palette=bg_palette)
+            bg_palette=bg_palette, four_color_luts=four_color_luts,
+            fg_lut_palettes=fg_palettes, bg_lut_palettes=bg_palettes)
         
         frames_data.append({
             'width': 640,
@@ -1727,15 +3241,17 @@ def process_animation_frames_memtext_global(input_dir, high_quality=False, split
     frames_data[0]['global_palette'] = fg_palette
     frames_data[0]['global_bg_palette'] = bg_palette
     frames_data[0]['global_font_sets'] = font_sets
+    if four_color_luts and fg_palettes is not None and bg_palettes is not None:
+        frames_data[0]['lut_palettes'] = {'fg': fg_palettes, 'bg': bg_palettes}
     
     return frames_data
 
 
-def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quality=False, split_palette=False, denoise=0):
+def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quality=False, split_palette=False, denoise=0, four_color_luts=False):
     """Process animation frames in MEMTEXT hybrid mode.
 
     Hybrid mode characteristics (workaround for FPGA LUT 1 bug):
-    - Global 256-color palette derived from all frames (output once, chunk_id=0)
+    - Global palette(s) derived from all frames (output once, chunk_id==lut_id)
     - Per-frame 512 medoids split into 2 font sets of 256 (output per frame)
     - Font set IDs alternate between pairs (0,1) and (2,3) for double buffering
     - No per-frame color palette output
@@ -1755,12 +3271,26 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
     print(f"Found {len(image_files)} image files")
 
     # Step 1: Create global palette(s)
-    if split_palette:
-        fg_palette, bg_palette = create_memtext_512_color_palette(image_files)
-        palette = fg_palette
+    fg_palettes = None
+    bg_palettes = None
+    if four_color_luts:
+        fg_palettes, bg_palettes = create_memtext_4lut_palettes(image_files, split_palette=split_palette)
+        if MEDOID_METHOD != 'legacy':
+            palette = merge_palettes_for_medoids(fg_palettes, bg_palettes)
+        else:
+            palette = fg_palettes[0]
+        fg_palette = fg_palettes[0]
+        bg_palette = bg_palettes[0]
     else:
-        palette = create_memtext_256_color_palette(image_files)
-        fg_palette = bg_palette = palette
+        if split_palette:
+            fg_palette, bg_palette = create_memtext_512_color_palette(image_files)
+            if MEDOID_METHOD != 'legacy':
+                palette = merge_palettes_for_medoids([fg_palette], [bg_palette])
+            else:
+                palette = fg_palette
+        else:
+            palette = create_memtext_256_color_palette(image_files)
+            fg_palette = bg_palette = palette
 
     frames_data = []
 
@@ -1793,7 +3323,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
 
             tile_assignments = assign_tiles_to_medoids(
                 frame_tiles, fg_palette, combined_medoids, high_quality=high_quality,
-                bg_palette=bg_palette)
+                bg_palette=bg_palette, four_color_luts=four_color_luts,
+                fg_lut_palettes=fg_palettes, bg_lut_palettes=bg_palettes)
 
             frames_data.append({
                 'width': 640,
@@ -1814,14 +3345,16 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
             image = load_and_scale_image(image_file)
             frame_tiles = extract_frame_tiles(image)
 
-            clustered_medoids = derive_medoids_from_tiles(frame_tiles, 512, palette)
+            clustered_medoids = derive_medoids_from_tiles(frame_tiles, 512, palette,
+                fg_palette=fg_palette, bg_palette=bg_palette)
             if denoise > 0:
                 clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
             font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
 
             tile_assignments = assign_tiles_to_medoids(
                 frame_tiles, fg_palette, clustered_medoids, high_quality=high_quality,
-                bg_palette=bg_palette)
+                bg_palette=bg_palette, four_color_luts=four_color_luts,
+                fg_lut_palettes=fg_palettes, bg_lut_palettes=bg_palettes)
 
             frames_data.append({
                 'width': 640,
@@ -1839,6 +3372,8 @@ def process_animation_frames_memtext_hybrid(input_dir, n_coherence=0, high_quali
     # Store global palette in first frame for output
     frames_data[0]['global_palette'] = fg_palette
     frames_data[0]['global_bg_palette'] = bg_palette
+    if four_color_luts and fg_palettes is not None and bg_palettes is not None:
+        frames_data[0]['lut_palettes'] = {'fg': fg_palettes, 'bg': bg_palettes}
 
     return frames_data
 
@@ -1847,9 +3382,9 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
     """Process animation frames in MEMTEXT frame mode.
 
     Frame mode characteristics:
-    - Per-frame 256-color palette (chunk type 0x01)
+    - Per-frame 256/512 color palette (chunk type 0x01)
     - Per-frame 512 medoids split into 2 font sets of 256 (chunk type 0x02)
-    - LUT chunk IDs alternate between 0 and 1 for double buffering
+    - LUT chunk IDs alternate between pairs (0,2) and (1,3) for double buffering
     - Font set IDs alternate between pairs (0,1) and (2,3)
     - Optional coherence medoids for cross-frame temporal stability
     """
@@ -1899,6 +3434,7 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
             frame_tiles = all_frame_tiles[frame_idx]
             frame_canonical = all_frame_canonical_sets[frame_idx]
 
+            # Per-frame palette derivation (256 colors, or split 2x256=512)
             palette = create_memtext_256_color_palette_from_image(image)
             if split_palette:
                 fg_pal, bg_pal = create_memtext_512_color_palette_from_image(image)
@@ -1935,14 +3471,18 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
 
             if split_palette:
                 fg_pal, bg_pal = create_memtext_512_color_palette_from_image(image)
-                palette = fg_pal
+                if MEDOID_METHOD != 'legacy':
+                    palette = merge_palettes_for_medoids([fg_pal], [bg_pal])
+                else:
+                    palette = fg_pal
             else:
                 palette = create_memtext_256_color_palette_from_image(image)
                 fg_pal = bg_pal = palette
             frame_tiles = extract_frame_tiles(image)
 
             clustered_medoids = derive_medoids_from_tiles(
-                frame_tiles, 512, palette)
+                frame_tiles, 512, palette,
+                fg_palette=fg_pal, bg_palette=bg_pal)
             if denoise > 0:
                 clustered_medoids = denoise_medoid_set(clustered_medoids, denoise)
             font_sets_local = [clustered_medoids[i * 256:(i + 1) * 256] for i in range(2)]
@@ -1967,37 +3507,54 @@ def process_animation_frames_memtext_frame(input_dir, n_coherence=0, high_qualit
     return frames_data
 
 
-def optimize_character_memtext(char_img, palette):
-    """Optimize a character tile using 256-color palette.
+def optimize_character_memtext(char_img, palette, palette_oklab=None, use_oklab=False):
+    """Optimize a character tile using a palette.
     Returns (font_def, fg_idx, bg_idx) where font_def is 8 bytes.
-    
+
     Args:
         char_img: 8x8x3 RGB pixel array
-        palette: 256x3 color palette
+        palette: (N,3) color palette (uint8)
+        palette_oklab: optional precomputed Oklab palette (N,3) float32
+        use_oklab: if True, use Oklab distances for nearest-color matching
     """
     # Flatten to 64 pixels
     pixels = char_img.reshape(-1, 3).astype(np.float32)
     palette_f = palette.astype(np.float32)
-    
+
+    # Whether the palette reserves index 0 for transparency (classic 256 palette)
+    has_transparency_index = (palette.shape[0] == 256)
+
+    # If requested, precompute Oklab palette
+    if use_oklab and palette_oklab is None:
+        try:
+            palette_oklab = rgb_to_oklab(palette.astype(np.float32))
+        except Exception:
+            palette_oklab = None
+
     # Find two most distinct colors in the tile using luminance thresholding
     unique_colors = np.unique(pixels, axis=0)
     if len(unique_colors) < 2:
         # Uniform tile
         avg_color = pixels.mean(axis=0)
         # Find closest palette color
-        dists = np.linalg.norm(palette_f - avg_color, axis=1)
-        dists[0] = float('inf')  # Skip transparent
+        if use_oklab and (palette_oklab is not None):
+            center_ok = rgb_to_oklab(avg_color.reshape(1, 3)).reshape(3)
+            dists = np.linalg.norm(palette_oklab - center_ok, axis=1)
+        else:
+            dists = np.linalg.norm(palette_f - avg_color, axis=1)
+        if has_transparency_index:
+            dists[0] = float('inf')  # Skip transparent
         best_idx = int(np.argmin(dists))
         return np.zeros(8, dtype=np.uint8), best_idx, 0
-    
+
     # Use luminance-based thresholding
     luminance = 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]
-    
+
     threshold = np.median(luminance)
-    
+
     fg_mask = luminance >= threshold
     bg_mask = ~fg_mask
-    
+
     # Compute average colors for each region
     if np.any(fg_mask):
         fg_center = pixels[fg_mask].mean(axis=0)
@@ -2007,20 +3564,28 @@ def optimize_character_memtext(char_img, palette):
         bg_center = pixels[bg_mask].mean(axis=0)
     else:
         bg_center = pixels.mean(axis=0)
-    
-    # Map centers to closest palette colors
-    fg_dists = np.linalg.norm(palette_f - fg_center, axis=1)
-    fg_dists[0] = float('inf')  # Skip transparent
+
+    # Map centers to closest palette colors using either RGB or Oklab
+    if use_oklab and (palette_oklab is not None):
+        fg_ok = rgb_to_oklab(fg_center.reshape(1, 3)).reshape(3)
+        bg_ok = rgb_to_oklab(bg_center.reshape(1, 3)).reshape(3)
+        fg_dists = np.linalg.norm(palette_oklab - fg_ok, axis=1)
+        bg_dists = np.linalg.norm(palette_oklab - bg_ok, axis=1)
+    else:
+        fg_dists = np.linalg.norm(palette_f - fg_center, axis=1)
+        bg_dists = np.linalg.norm(palette_f - bg_center, axis=1)
+
+    if has_transparency_index:
+        fg_dists[0] = float('inf')  # Skip transparent
+
     fg_idx = int(np.argmin(fg_dists))
-    
-    bg_dists = np.linalg.norm(palette_f - bg_center, axis=1)
     bg_idx = int(np.argmin(bg_dists))
-    
+
     # Ensure fg != bg
     if fg_idx == bg_idx:
         bg_dists[bg_idx] = float('inf')
         bg_idx = int(np.argmin(bg_dists))
-    
+
     # Build font pattern: 1 where fg_mask, 0 where bg_mask
     font_def = np.zeros(8, dtype=np.uint8)
     for row in range(8):
@@ -2030,14 +3595,14 @@ def optimize_character_memtext(char_img, palette):
             if fg_mask[pixel_idx]:
                 byte |= (1 << (7 - col))
         font_def[row] = byte
-    
+
     return font_def, fg_idx, bg_idx
 
-def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=False, encoding_mode='global'):
+def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=False, encoding_mode='global', four_color_luts=False):
     """Save binary output in MEMTEXT format.
-    
+
     Key differences from regular format:
-    - Text Color LUT: 2048 bytes (256 colors * 4 bytes BGRA, FG followed by BG but they're identical)
+    - Text Color LUT: 1024 bytes per LUT (256 entries × 4 bytes BGRA). FG and BG palettes are emitted as separate LUT chunks.
     - Text Font Data: 4 chunks of 2048 bytes each (font sets 0-3)
     - Per frame: 5 character chunks, 5 color chunks (RLE if use_rle=True, fixed otherwise)
     """
@@ -2062,25 +3627,58 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
     with open(output_bin, 'wb') as f:
         # Write header: 8 bytes
         f.write(struct.pack('BBBBBBBB', magic, version, frame_duration_byte, mode, columns, rows, xoffset, yoffset))
+
+        # Frame mode cannot support four-color-luts (double-buffering required).
+        if encoding_mode == 'frame' and four_color_luts:
+            print("Warning: --four-color-luts is not supported with frame encoding; disabling for output.")
+            four_color_luts = False
         
         if encoding_mode in ('global', 'hybrid'):
-            fg_bgra = np.zeros((256, 4), dtype=np.uint8)
-            fg_bgra[:, 0] = palette[:, 2]
-            fg_bgra[:, 1] = palette[:, 1]
-            fg_bgra[:, 2] = palette[:, 0]
-            fg_bgra[:, 3] = 255
-            fg_bgra[0, 3] = 0
+            # If four-color-luts mode is enabled, frames_data[0] may carry
+            # explicit LUT palettes under key 'lut_palettes' as a dict:
+            #   {'fg': [fg0, fg1], 'bg': [bg0, bg1]}
+            if four_color_luts and frames_data and 'lut_palettes' in frames_data[0]:
+                lut_palettes = frames_data[0]['lut_palettes']
+                # Emit one‑LUT chunks (1024 bytes each). Maintain ordering:
+                # FG entries -> chunk IDs 0..(n_fg-1), BG entries -> chunk IDs 2..(2+n_bg-1)
+                fg_list = list(lut_palettes.get('fg', []))
+                bg_list = list(lut_palettes.get('bg', []))
+                pal_list = fg_list + bg_list
+                for idx, pal in enumerate(pal_list):
+                    pal_bgra = np.zeros((256, 4), dtype=np.uint8)
+                    pal_bgra[:, 0] = pal[:, 2]
+                    pal_bgra[:, 1] = pal[:, 1]
+                    pal_bgra[:, 2] = pal[:, 0]
+                    pal_bgra[:, 3] = 255
+                    pal_bgra[0, 3] = 0
+                    lut_data = pal_bgra.tobytes()
+                    chunk_id = palette_list_index_to_chunk_id(idx, len(fg_list))
+                    f.write(struct.pack('BBH', 0x01, chunk_id & 0xFF, len(lut_data)))
+                    f.write(lut_data)
+            else:
+                # Emit separate 1-LUT chunks (1024 bytes each): FG -> id 0, BG -> id 2
+                fg_bgra = np.zeros((256, 4), dtype=np.uint8)
+                fg_bgra[:, 0] = palette[:, 2]
+                fg_bgra[:, 1] = palette[:, 1]
+                fg_bgra[:, 2] = palette[:, 0]
+                fg_bgra[:, 3] = 255
+                fg_bgra[0, 3] = 0
 
-            bg_bgra = np.zeros((256, 4), dtype=np.uint8)
-            bg_bgra[:, 0] = bg_palette_global[:, 2]
-            bg_bgra[:, 1] = bg_palette_global[:, 1]
-            bg_bgra[:, 2] = bg_palette_global[:, 0]
-            bg_bgra[:, 3] = 255
-            bg_bgra[0, 3] = 0
+                bg_bgra = np.zeros((256, 4), dtype=np.uint8)
+                bg_bgra[:, 0] = bg_palette_global[:, 2]
+                bg_bgra[:, 1] = bg_palette_global[:, 1]
+                bg_bgra[:, 2] = bg_palette_global[:, 0]
+                bg_bgra[:, 3] = 255
+                bg_bgra[0, 3] = 0
 
-            lut_data = fg_bgra.tobytes() + bg_bgra.tobytes()
-            f.write(struct.pack('BBH', 0x01, 0x00, len(lut_data)))
-            f.write(lut_data)
+                lut_data_fg = fg_bgra.tobytes()
+                lut_data_bg = bg_bgra.tobytes()
+
+                # Emit FG (index 0) and BG (index 1) using canonical mapping
+                f.write(struct.pack('BBH', 0x01, palette_list_index_to_chunk_id(0, 1) & 0xFF, len(lut_data_fg)))
+                f.write(lut_data_fg)
+                f.write(struct.pack('BBH', 0x01, palette_list_index_to_chunk_id(1, 1) & 0xFF, len(lut_data_bg)))
+                f.write(lut_data_bg)
 
             if encoding_mode == 'global':
                 for fs_id in range(4):
@@ -2103,7 +3701,10 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
                 frame_font_sets = frame_data['font_sets']
                 lut_id = frame_data.get('lut_id', frame_idx % 2)
                 font_id_base = frame_data.get('font_id_base', 0 if (frame_idx % 2 == 0) else 2)
-
+                # Per-frame LUTs: in four-color mode the frame may provide
+                # 'lut_palettes' with {'fg': [fg0, fg1], 'bg': [bg0, bg1]}
+                # Frame-mode: emit two 1-LUT chunks per frame (double-buffered)
+                # FG -> chunk (lut_id & 1), BG -> chunk (2 + (lut_id & 1))
                 fg_bgra = np.zeros((256, 4), dtype=np.uint8)
                 fg_bgra[:, 0] = frame_fg_pal[:, 2]
                 fg_bgra[:, 1] = frame_fg_pal[:, 1]
@@ -2118,9 +3719,15 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
                 bg_bgra[:, 3] = 255
                 bg_bgra[0, 3] = 0
 
-                lut_data = fg_bgra.tobytes() + bg_bgra.tobytes()
-                f.write(struct.pack('BBH', 0x01, lut_id & 0x01, len(lut_data)))
-                f.write(lut_data)
+                fg_chunk_id, bg_chunk_id = lut_id_to_fg_bg_chunk_ids(lut_id)
+
+                lut_data_fg = fg_bgra.tobytes()
+                lut_data_bg = bg_bgra.tobytes()
+
+                f.write(struct.pack('BBH', 0x01, fg_chunk_id & 0xFF, len(lut_data_fg)))
+                f.write(lut_data_fg)
+                f.write(struct.pack('BBH', 0x01, bg_chunk_id & 0xFF, len(lut_data_bg)))
+                f.write(lut_data_bg)
 
                 for local_fs in range(2):
                     font_data = frame_font_sets[local_fs].astype(np.uint8).tobytes()
@@ -2157,21 +3764,25 @@ def save_output_bin_memtext(frames_data, output_bin, frame_duration=6, use_rle=F
                 if encoding_mode in ('frame', 'hybrid'):
                     fs = (font_id_base + fs) & 0x03
                 char_idx = tile_assignments[i, 1]
-                invert = tile_assignments[i, 4]
-                # Per spec:
-                #   bits [8:9]   = font bank
-                #   bits [10:11] = combined LUT select for both FG/BG
-                #                  00 -> LUT0, 01 -> LUT1
-                #                  10/11 are not used
-                #   bit  [12]    = invert
-                # High byte mapping:
-                #   bit0..1 -> word bits8..9
-                #   bit2..3 -> word bits10..11 (LUT select)
-                #   bit4    -> word bit12
-                lut_sel = lut_id & 0x01
+                invert = int(tile_assignments[i, 4])
+
+                # Per spec bits mapping — extended for four-color-luts
+                # bits [8:9] = font bank
+                # bit 10 = FG LUT select
+                # bit 11 = BG LUT select
+                # bit 12 = invert
+                if four_color_luts and getattr(tile_assignments, 'shape', None) and tile_assignments.shape[1] >= 7:
+                    fg_lut_bit = int(tile_assignments[i, 5]) & 0x01
+                    bg_lut_bit = int(tile_assignments[i, 6]) & 0x01
+                else:
+                    lut_sel = lut_id & 0x01
+                    fg_lut_bit = lut_sel
+                    bg_lut_bit = lut_sel
+
                 high_byte = (
                     (fs & 0x03)
-                    | ((lut_sel & 0x01) << 2)
+                    | ((fg_lut_bit & 0x01) << 2)
+                    | ((bg_lut_bit & 0x01) << 3)
                     | ((invert & 0x01) << 4)
                 )
                 word = (char_idx & 0xFF) | (high_byte << 8)
