@@ -24,15 +24,30 @@
 - Chunk Length: 0 bytes
 - Chunk Data: empty
 ### Text Color LUT
+### Text Color LUT
 - Chunk Type: $01
-- Chunk ID: $00 
-- Chunk Length: 128 bytes # for MEMTEXT the Chunk Length will be 2048 (2 * 256 * 4)
-- Chunk Data: FG LUT data followed by BG LUT data
-### Text Color LUT for MEMTEXT
-- Chunk Type: $01
-- Chunk ID: $00 
-- Chunk Length: 2048 (2 * 256 * 4)
-- Chunk Data: FG LUT data followed by BG LUT data.
+- Chunk Length: 1024 bytes (256 entries × 4 bytes BGRA) — canonical per‑LUT chunk for MEMTEXT.
+- Chunk Data: 256 BGRA palette entries (one LUT).
+
+- Chunk ID mapping (per‑LUT):
+	- $00: FG LUT 0 (FG0)
+	- $01: FG LUT 1 (FG1)
+	- $02: BG LUT 0 (BG0)
+	- $03: BG LUT 1 (BG1)
+
+Notes:
+- Global / Hybrid mode:
+	- For single 256‑color output (no `--split-palette`): emit FG LUT as Chunk ID $00 and BG LUT as Chunk ID $02. If FG and BG are identical the BG chunk may duplicate the FG chunk.
+	- For split‑palette (512 colors): emit separate FG (Chunk ID $00) and BG (Chunk ID $02) LUT chunks containing independent 256‑entry palettes.
+	- With `--four-color-luts` enabled, emit up to four 1024‑byte LUT chunks in order: FG0 ($00), FG1 ($01), BG0 ($02), BG1 ($03).
+
+- Frame mode (double‑buffered):
+	- Per‑frame LUTs are double‑buffered. The LUT buffer index `lut_id` selects the pair of chunk IDs:
+		- `lut_id == 0`: FG = Chunk $00, BG = Chunk $02
+		- `lut_id == 1`: FG = Chunk $01, BG = Chunk $03
+	- Frame mode does not support `--four-color-luts` (the LUT memory is used for double buffering).
+
+- Backwards compatibility: readers may still accept the legacy combined 2048‑byte FG+BG chunk (Chunk Type $01, Chunk Length $0800). In that case the first 1024 bytes are treated as the FG LUT and the second 1024 bytes as the BG LUT; these are mapped to buffer index `(Chunk ID & 0x01)`.
 ### Text Font Data
 - Chunk Type: $02
 - Chunk ID: $00

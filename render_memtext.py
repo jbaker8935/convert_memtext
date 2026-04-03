@@ -2,8 +2,14 @@
 """
 Module to parse and render MEMTEXT binary animation files.
 
-MEMTEXT format uses:
-- 256-color palettes (FG and BG are identical)
+MEMTEXT format details (canonical):
+- Text Color LUT: chunk type 0x01; canonical form is 1024 bytes per LUT (256 entries × 4 bytes BGRA).
+- Chunk ID mapping: 0=FG0, 1=FG1, 2=BG0, 3=BG1.
+- Global/Hybrid: FG emitted as chunk 0 and BG as chunk 2 (or both if split-palette).
+- Frame mode: double-buffered pairs (FG=0/BG=2) and (FG=1/BG=3). Frame mode does not support `--four-color-luts`.
+- Legacy: readers accept combined 2048-byte FG+BG chunk for backwards compatibility (first 1024 = FG, second 1024 = BG).
+
+Other format details:
 - 4 font sets of 256 patterns each (1024 total)
 - Per-tile: font_set, char_index, fg_color, bg_color, invert_bit
 - RLE word-based encoding for character and color data
@@ -184,6 +190,21 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                     palette_sets[chunk_id & 0x01] = fg_palette
                     bg_palette_sets[chunk_id & 0x01] = bg_palette
                     print(f"Loaded MEMTEXT palette (LUT ID {chunk_id})")
+                elif chunk_length == 1024:
+                    # Single LUT chunk (256 BGRA entries)
+                    lut_data = f.read(chunk_length)
+                    pal = []
+                    for i in range(256):
+                        offset = i * 4
+                        b, g, r, a = lut_data[offset:offset+4]
+                        pal.append((r, g, b, a))
+                    if chunk_id in (0, 1):
+                        palette_sets[chunk_id] = pal
+                    elif chunk_id in (2, 3):
+                        bg_palette_sets[chunk_id - 2] = pal
+                    else:
+                        print(f"Warning: Unknown LUT chunk id {chunk_id}")
+                    print(f"Loaded MEMTEXT LUT chunk id {chunk_id}")
                 elif chunk_length == 128:
                     lut_data = f.read(chunk_length)
                     palette = []
@@ -262,6 +283,19 @@ def render_memtext_frames(input_file, output_dir, progress_callback=None):
                             bg_palette.append((r, g, b, a))
                         palette_sets[chunk_id & 0x01] = fg_palette
                         bg_palette_sets[chunk_id & 0x01] = bg_palette
+                    elif chunk_length == 1024:
+                        lut_data = f.read(chunk_length)
+                        pal = []
+                        for i in range(256):
+                            offset = i * 4
+                            b, g, r, a = lut_data[offset:offset+4]
+                            pal.append((r, g, b, a))
+                        if chunk_id in (0, 1):
+                            palette_sets[chunk_id] = pal
+                        elif chunk_id in (2, 3):
+                            bg_palette_sets[chunk_id - 2] = pal
+                        else:
+                            pass
                     elif chunk_length == 128:
                         lut_data = f.read(chunk_length)
                         palette = []
@@ -390,7 +424,8 @@ def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns
         char_idx = char_data[tile_idx * 2]
         info_byte = char_data[tile_idx * 2 + 1]
         font_set_id = info_byte & 0x03          # bits [0:1] of high byte (bits 8-9)
-        lut_sel = (info_byte >> 2) & 0x03       # bits [2:3] of high byte (bits 10-11)
+        fg_lut_bit = (info_byte >> 2) & 0x01    # bit 2 of high byte (bit 10)
+        bg_lut_bit = (info_byte >> 3) & 0x01    # bit 3 of high byte (bit 11)
         invert = (info_byte >> 4) & 0x01        # bit 4 of high byte (bit 12)
         
         # Parse color data: bg in low byte, fg in high byte
@@ -409,16 +444,13 @@ def render_memtext_frame(char_data, color_data, font_sets, palette_sets, columns
         
         pattern = font_sets[font_set_id][char_idx]
         
-        # Use combined LUT selector for both FG and BG.
-        # Valid selectors are 0 (00) and 1 (01). Any other value falls back to LUT0.
-        if lut_sel > 1:
-            lut_sel = 0
-        fg_palette = palette_sets[lut_sel]
+        # Per-tile FG/BG LUT selection (each a single bit)
+        fg_palette = palette_sets[fg_lut_bit]
         if fg_palette is None:
-            fg_palette = palette_sets[1 - lut_sel]
-        bg_palette = bg_palette_sets[lut_sel]
+            fg_palette = palette_sets[0] if palette_sets[0] is not None else palette_sets[1]
+        bg_palette = bg_palette_sets[bg_lut_bit]
         if bg_palette is None:
-            bg_palette = bg_palette_sets[1 - lut_sel]
+            bg_palette = bg_palette_sets[0] if bg_palette_sets[0] is not None else bg_palette_sets[1]
         if fg_palette is None or bg_palette is None:
             continue
 
