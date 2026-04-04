@@ -12,14 +12,9 @@ from sklearn.cluster import KMeans
 # Global configuration flags set by command-line arguments
 CROP_TO_FILL = False  # when True, images are scaled and then center-cropped to exactly 640×480
 # Medoid derivation method (can be overridden from CLI)
-MEDOID_METHOD = 'legacy'  # choices: 'legacy', 'oklab_kmeans', 'oklab_kmedoids_clara'
+MEDOID_METHOD = 'legacy'  # choices: 'legacy', 'oklab_kmeans'
 MEDOID_CANDIDATES = 1
-# CLARA+PAM defaults (can be overridden via CLI)
-MEDOID_CLARA_SUBSAMPLES = 3
-MEDOID_CLARA_SUBSAMPLE_SIZE = 5000
-MEDOID_PAM_SWAP_BUDGET = 500
-MEDOID_EVAL_SAMPLE_SIZE = 5000
-MEDOID_CLARA_SEED = 42
+# (CLARA implementation removed; medoid method choices limited)
 
 # Optional: prefer cuML KMeans if available (GPU acceleration). Fallback to sklearn KMeans.
 try:
@@ -464,8 +459,8 @@ def main():
 
     # Set medoid method globally for helper functions
     # High-quality now uses the perceptual KMeans medoid derivation
-    # (`derive_medoids_oklab_kmeans`) which is faster and perceptually similar
-    # to CLARA+PAM. Otherwise use legacy method.
+    # (`derive_medoids_oklab_kmeans`) which is faster and perceptually similar.
+    # Otherwise use legacy method.
     global MEDOID_METHOD
     MEDOID_METHOD = 'oklab_kmeans' if args.high_quality else 'legacy'
 
@@ -1205,17 +1200,7 @@ def derive_medoids_from_tiles(frame_tiles, n_medoids, palette, fg_palette=None, 
             font_features = perceptual_descriptors
 
         # Route to the requested perceptual medoid method
-        if MEDOID_METHOD == 'oklab_kmedoids_clara':
-            clustered_medoids = derive_medoids_clara_pam(
-                frame_tiles, cluster_target, palette,
-                subsamples=MEDOID_CLARA_SUBSAMPLES,
-                subsample_size=MEDOID_CLARA_SUBSAMPLE_SIZE,
-                candidates=max(2, MEDOID_CANDIDATES),
-                pam_budget=MEDOID_PAM_SWAP_BUDGET,
-                eval_size=MEDOID_EVAL_SAMPLE_SIZE,
-                seed=MEDOID_CLARA_SEED,
-                fg_palette=fg_palette, bg_palette=bg_palette)
-        elif MEDOID_METHOD == 'oklab_kmeans':
+        if MEDOID_METHOD == 'oklab_kmeans':
             clustered_medoids = derive_medoids_oklab_kmeans(
                 frame_tiles, cluster_target, palette,
                 candidates=max(2, MEDOID_CANDIDATES),
@@ -1890,273 +1875,10 @@ def _score_medoid_set(medoid_masks, pixel_means_oklab, counts_arr, palette_oklab
     return float(cost_matrix.min(axis=1).sum())
 
 
-def derive_medoids_clara_pam(frame_tiles, n_medoids, palette, subsamples=2, subsample_size=5000,
-                             candidates=5, pam_budget=200, eval_size=1000, seed=42,
-                             fg_palette=None, bg_palette=None):
-    """Derive medoids via CLARA subsampling + efficient delta-cost PAM refinement.
-
-    Key improvements over the prior implementation:
-
-    1. **Perceptual clustering**: CLARA KMeans runs on per-position Oklab means
-       (not PCA of structural bytes), so each subsample finds better cluster seeds.
-
-    2. **Count-weighted KMeans**: frequent patterns attract cluster centers.
-
-    3. **Richer candidate evaluation per cluster**: top-K centroid-nearest members
-       AND Hamming medoid are scored with the Oklab criterion.
-
-    4. **Efficient delta-cost PAM**: the cost matrix is computed once per PAM sweep;
-       each swap trial uses the previously cached matrix columns and the O(n_eval)
-       delta formula to test a proposed swap without recomputing the full scoring.
-       Non-medoids are ordered by occurrence count so that high-frequency patterns
-       are tried first, maximising early improvement.
-
-    5. **Split-palette aware**: optional fg_palette / bg_palette for accurate scoring.
-
-    Args:
-        frame_tiles: list of tile dicts.
-        n_medoids: desired medoid count.
-        palette: (N, 3) uint8 reference / merged palette.
-        subsamples: number of CLARA subsample KMeans runs.
-        subsample_size: max patterns per CLARA subsample.
-        candidates: cluster-local candidates to score per cluster.
-        pam_budget: max swap trials for PAM refinement.
-        eval_size: evaluation set size for CLARA run scoring.
-        seed: RNG seed.
-        fg_palette: optional (256, 3) uint8 FG palette for scoring.
-        bg_palette: optional (256, 3) uint8 BG palette for scoring.
-    """
-    # ------------------------------------------------------------------ #
-    #  Step 1: collect canonical pattern stats                             #
-    # ------------------------------------------------------------------ #
-    patterns_arr, counts_arr, pixel_means = _collect_pattern_stats(frame_tiles, palette)
-    counts_arr = counts_arr.astype(np.float64)
-
-    if len(patterns_arr) == 0:
-        return np.zeros((n_medoids, 8), dtype=np.uint8)
-
-    n_unique = len(patterns_arr)
-    cluster_target = min(n_unique, n_medoids)
-    if cluster_target < n_medoids:
-        pad_count = n_medoids - len(patterns_arr)
-        out = np.vstack([patterns_arr,
-                         np.zeros((pad_count, 8), dtype=np.uint8)]) if pad_count > 0 else patterns_arr.copy()
-        _ensure_zero_medoid(out)
-        return out
-
-    # ------------------------------------------------------------------ #
-    #  Step 2: build perceptual + structural features                      #
-    # ------------------------------------------------------------------ #
-    palette_oklab = rgb_to_oklab(palette.astype(np.float32))
-    pixel_means_oklab = rgb_to_oklab(pixel_means.reshape(-1, 3)).reshape(n_unique, 64, 3)
-
-    fg_palette_oklab = (rgb_to_oklab(fg_palette.astype(np.float32))
-                        if fg_palette is not None else None)
-    bg_palette_oklab = (rgb_to_oklab(bg_palette.astype(np.float32))
-                        if bg_palette is not None else None)
-
-    # Precompute palette squared-norms once; passed to every cost column call
-    _pal_fg = fg_palette_oklab if fg_palette_oklab is not None else palette_oklab
-    _pal_bg = bg_palette_oklab if bg_palette_oklab is not None else palette_oklab
-    fg_pal_norms = (_pal_fg * _pal_fg).sum(axis=1)
-    bg_pal_norms = (_pal_bg * _pal_bg).sum(axis=1)
-
-    raw_bytes = patterns_arr.astype(np.float32)
-    raw_n = ((raw_bytes - raw_bytes.mean(axis=0))
-             / (raw_bytes.std(axis=0) + 1e-6))
-    font_features = _build_perceptual_cluster_features(
-        pixel_means_oklab, struct_feats=raw_n, perceptual_weight=8.0)
-
-    rng = np.random.RandomState(seed)
-
-    # Evaluation indices (frequency-weighted sampling for fair global assessment)
-    if eval_size >= n_unique:
-        eval_idxs = np.arange(n_unique)
-    else:
-        probs = counts_arr / counts_arr.sum()
-        eval_idxs = rng.choice(n_unique, size=min(eval_size, n_unique),
-                               replace=False, p=probs)
-
-    best_cost = float('inf')
-    best_medoids_idx = None
-
-    # ------------------------------------------------------------------ #
-    #  Step 3: CLARA subsample runs                                        #
-    # ------------------------------------------------------------------ #
-    for r in range(max(1, subsamples)):
-        sample_size = min(subsample_size, n_unique)
-        if sample_size <= cluster_target:
-            subsample_idxs = np.arange(n_unique)
-        else:
-            probs = counts_arr / counts_arr.sum()
-            subsample_idxs = rng.choice(n_unique, size=sample_size,
-                                        replace=False, p=probs)
-
-        sample_feats = font_features[subsample_idxs]
-        sample_counts = counts_arr[subsample_idxs].astype(np.float32)
-
-        kmeans = make_kmeans(n_clusters=cluster_target, random_state=seed + r, n_init=10)
-        try:
-            kmeans.fit(sample_feats, sample_weight=sample_counts)
-        except TypeError:
-            kmeans.fit(sample_feats)
-
-        labels_r = kmeans.labels_
-        try:
-            centers_r = kmeans.cluster_centers_
-        except Exception:
-            centers_r = np.array([
-                sample_feats[labels_r == k].mean(axis=0) if np.any(labels_r == k) else sample_feats[0]
-                for k in range(cluster_target)
-            ])
-
-        # Per-cluster candidate evaluation; track running cost to compare subsample runs
-        medoid_idxs = []
-        total_cost_r = 0.0
-        for k in range(cluster_target):
-            mem_local = np.where(labels_r == k)[0]
-            if len(mem_local) == 0:
-                medoid_idxs.append(int(subsample_idxs[0]))
-                continue
-            mem_global = subsample_idxs[mem_local]
-
-            cand_set = set()
-            # Top-K centroid neighbours
-            fdists = np.linalg.norm(sample_feats[mem_local] - centers_r[k], axis=1)
-            order = np.argsort(fdists)
-            for ri in order[:max(1, min(candidates, len(order)))]:
-                cand_set.add(int(mem_global[ri]))
-            # Hamming medoid
-            bitmats_k = np.array([_pattern_bytes_to_mask(patterns_arr[gi]).astype(np.uint8)
-                                   for gi in mem_global])
-            sums_k = bitmats_k.sum(axis=1).astype(np.int32)
-            overlap_k = bitmats_k.dot(bitmats_k.T)
-            ham_total = (sums_k[:, None] + sums_k[None, :] - 2 * overlap_k).sum(axis=1)
-            cand_set.add(int(mem_global[int(np.argmin(ham_total))]))
-
-            member_px = pixel_means_oklab[mem_global]
-            member_w = counts_arr[mem_global].astype(np.float32)
-
-            best_local = float('inf')
-            best_local_idx = int(mem_global[0])
-            for ci in cand_set:
-                cost = _oklab_score_candidate(
-                    patterns_arr[ci], member_px, member_w,
-                    palette_oklab, fg_palette_oklab, bg_palette_oklab)
-                if cost < best_local:
-                    best_local = cost
-                    best_local_idx = ci
-            medoid_idxs.append(best_local_idx)
-            total_cost_r += best_local  # accumulate per-cluster cost for subsample comparison
-
-        medoid_idxs = np.array(medoid_idxs, dtype=int)
-        # Use accumulated per-cluster cost to select best subsample (avoids expensive global scoring)
-        if total_cost_r < best_cost:
-            best_cost = total_cost_r
-            best_medoids_idx = medoid_idxs.copy()
-
-    if best_medoids_idx is None:
-        return derive_medoids_oklab_kmeans(frame_tiles, n_medoids, palette,
-                                           candidates=candidates,
-                                           fg_palette=fg_palette, bg_palette=bg_palette)
-
-    # ------------------------------------------------------------------ #
-    #  Step 4: efficient delta-cost PAM refinement                         #
-    # ------------------------------------------------------------------ #
-    medoid_set = best_medoids_idx.copy()
-
-    if pam_budget > 0:
-        n_eval = len(eval_idxs)
-        eval_px = pixel_means_oklab[eval_idxs]   # (n_eval, 64, 3)
-        eval_w = counts_arr[eval_idxs]            # (n_eval,)
-        k = len(medoid_set)
-
-        # Build full cost matrix once with batched vectorised approach
-        cost_matrix = _build_cost_matrix_batched(
-            patterns_arr[medoid_set], eval_px,
-            _pal_fg, _pal_bg,
-            fg_pal_norms, bg_pal_norms)
-
-        # Per-pattern top-2 assignments (needed for O(n_eval) delta computation)
-        sorted2 = np.argsort(cost_matrix, axis=1)[:, :2]   # (n_eval, 2)
-        assign_j = sorted2[:, 0]
-        second_j = sorted2[:, 1]
-        best_costs = cost_matrix[np.arange(n_eval), assign_j]
-
-        # Non-medoids sorted by occurrence count descending (try common patterns first)
-        non_medoid_arr = np.setdiff1d(np.arange(n_unique), medoid_set)
-        nm_order = non_medoid_arr[np.argsort(-counts_arr[non_medoid_arr])]
-
-        trials = 0
-        no_improve_sweeps = 0
-        while trials < pam_budget and len(nm_order) > 0 and no_improve_sweeps < 3:
-            improved_this_sweep = False
-
-            for j in range(k):
-                if trials >= pam_budget:
-                    break
-
-                # Cluster members currently assigned to medoid j
-                assigned_j_mask = (assign_j == j)
-                second_cost_for_j = cost_matrix[np.arange(n_eval), second_j]
-
-                # Budget per medoid slot: share remaining budget
-                slots_left = k - j
-                nm_try = nm_order[:max(5, (pam_budget - trials) // max(1, slots_left))]
-                n_cands = min(len(nm_try), pam_budget - trials)
-                if n_cands <= 0:
-                    break
-                nm_batch = nm_try[:n_cands]
-                trials += n_cands
-
-                # Batch-compute cost columns for all candidates at once
-                batch_costs = _build_cost_matrix_batched(
-                    patterns_arr[nm_batch], eval_px,
-                    _pal_fg, _pal_bg, fg_pal_norms, bg_pal_norms)
-                # batch_costs: (n_eval, n_cands)
-
-                # Vectorised delta-cost over all candidates simultaneously
-                new_cost_all = np.where(
-                    assigned_j_mask[:, None],
-                    np.minimum(batch_costs, second_cost_for_j[:, None]),
-                    np.minimum(best_costs[:, None], batch_costs))
-                # new_cost_all: (n_eval, n_cands)
-                new_totals = (new_cost_all * eval_w[:, None]).sum(axis=0)  # (n_cands,)
-                old_total = float((best_costs * eval_w).sum())
-
-                best_nc = int(np.argmin(new_totals))
-                if new_totals[best_nc] < old_total - 1e-12:
-                    nm = nm_batch[best_nc]
-                    cost_c = batch_costs[:, best_nc]
-                    # Accept swap: update medoid_set, cost_matrix, tracking arrays
-                    old_m = medoid_set[j]
-                    medoid_set[j] = nm
-                    cost_matrix[:, j] = cost_c
-                    nm_order = np.concatenate([nm_order[nm_order != nm], [old_m]])
-                    nm_order = nm_order[np.argsort(-counts_arr[nm_order])]
-                    sorted2 = np.argsort(cost_matrix, axis=1)[:, :2]
-                    assign_j = sorted2[:, 0]
-                    second_j = sorted2[:, 1]
-                    best_costs = cost_matrix[np.arange(n_eval), assign_j]
-                    improved_this_sweep = True
-
-            if not improved_this_sweep:
-                no_improve_sweeps += 1
-            else:
-                no_improve_sweeps = 0
-
-    # ------------------------------------------------------------------ #
-    #  Step 5: assemble result                                             #
-    # ------------------------------------------------------------------ #
-    final_medoids = patterns_arr[medoid_set]
-    if len(final_medoids) < n_medoids:
-        pad = np.zeros((n_medoids - len(final_medoids), 8), dtype=np.uint8)
-        final_medoids = np.vstack([final_medoids, pad])
-    elif len(final_medoids) > n_medoids:
-        final_medoids = final_medoids[:n_medoids]
-
-    _ensure_zero_medoid(final_medoids)
-    return final_medoids
+# CLARA+PAM medoid derivation removed
+# The prior `derive_medoids_clara_pam` implementation has been removed
+# due to limited benefit over `oklab_kmeans` and poor performance.
+# If needed in future, a replacement implementation can be reintroduced.
 
 
 
